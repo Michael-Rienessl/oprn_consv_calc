@@ -152,12 +152,15 @@ A highly detailed data table containing:
 A visual genome map for every assembled operon across all species. Genes are colored according to the `color_code` dictionary in the input JSON, with intergenic (non-reference) insertions colored separately to visualize operon degradation or horizontal gene transfer.
 
 **3. Automated iTOL Datasets (`/itol/`)**
-The pipeline automatically parses the `output.csv` using NCBI Taxonomy to build phylogenetic trees and interactive annotation datasets for the [Interactive Tree Of Life (iTOL)](https://itol.embl.de/):
-* `taxonomy_tree_full.nwk` / `taxonomy_tree_genus.nwk`: The calculated Newick trees.
-* `itol_AAI_HEATMAP.txt`: Color gradient dataset for Average Amino Acid Identity.
-* `itol_STRUCT_HEATMAP.txt`: Color gradient dataset for Operon Structural Similarity.
-* `itol_PROTEIN_HEATMAP.txt`: Individual heatmaps for each reference gene.
-* `itol_POPUP_INFO.txt`: An interactive HTML popup for each leaf in the tree, displaying the exact assembly accessions, metadata, and individual percent identities.
+The pipeline automatically parses the `output.csv` using NCBI Taxonomy to build **taxonomic trees** and interactive annotation datasets for the [Interactive Tree Of Life (iTOL)](https://itol.embl.de/). 
+
+*How to use in iTOL:* First, upload one of the `.nwk` tree files to your iTOL account. Then, simply drag and drop the generated `.txt` annotation files directly onto your tree visualization in the browser to overlay the data.
+
+* `taxonomy_tree_full.nwk` / `taxonomy_tree_genus.nwk`: The calculated taxonomic Newick trees (representing the NCBI lineage).
+* `itol_AAI_HEATMAP.txt`: Color gradient annotation file for the Average Amino Acid Identity.
+* `itol_STRUCT_HEATMAP.txt`: Color gradient annotation file for the Operon Structural Similarity.
+* `itol_PROTEIN_HEATMAP.txt`: Individual heatmap annotation files for each reference gene.
+* `itol_POPUP_INFO.txt`: An interactive HTML popup annotation for each leaf in the tree, displaying the exact assembly accessions, metadata, and individual percent identities.
 
 ### Usage
 Once the `conda` environment is set up, the script can be ran via command line: <br><br>
