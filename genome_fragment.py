@@ -8,6 +8,7 @@ from features import GenomeFeature
 from operon import Operon
 import time
 import os
+import logging
 
 class GenomeFragment:
     '''
@@ -35,133 +36,93 @@ class GenomeFragment:
 
     def fetch_features(self):
         '''
-        Obtains all coding features in the genome and saves them as a list of GenomeFeature objects
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        None
+        Obtain all coding features in the genome and save them as GenomeFeature objects.
+        Uses a SeqRecord-based parser for both local and remote records.
         '''
-        #Checks if the genome record has been obtained yet. 
-        if self.full_record == None:
+
+        if self.full_record is None:
             self.fetch_record()
         
-        for feature in self.full_record[0]['GBSeq_feature-table']:
-            if feature['GBFeature_key'] == 'CDS':
-                if 'GBInterval_from' in feature['GBFeature_intervals'][0]:
-                    
-                    #Record the start and stop positions for the coding region
-                    coding_start = int(feature['GBFeature_intervals'][0]['GBInterval_from'])
-                    coding_end = int(feature['GBFeature_intervals'][0]['GBInterval_to'])
+        self.all_features = []
 
-                    #Parse out the strand
-                    strand = ''
+        for feat in self.full_record.features:
+            gf = self._seqfeature_to_genomefeature(feat, self.full_record)
+            if gf is not None:
+                self.all_features.append(gf)
 
-                    if int(coding_end) - int(coding_start) > 0:
-                        strand = '+'
-                    elif int(coding_end) - int(coding_start) < 0:
-                        strand = '-'
+        self.sort_all_features()
 
-                    #Will hold the parsed protein accession number
-                    protein_accession = None
+        
+        logging.info("=== GENBANK PARSER SANITY CHECK ===")
+        logging.info(f"Fragment Accession: {getattr(self, 'genome_accession', 'N/A')}")
+        logging.info(f"Total features parsed: {len(self.all_features)}")
 
-                    #Will hold the parsed locus tag
-                    locus_tag = None
+        # Zeige nur die ersten 3 Gene des gesamten Genoms kompakt an
+        for i, feat in enumerate(self.all_features):
+            seq = getattr(feat, 'aa_sequence', '')
+            seq_display = f"{seq[:20]}... (Len: {len(seq)})" if seq else "FEHLT (None)"
+            
+            logging.info(
+                f"  Gen {i+1} | "
+                f"Locus: {getattr(feat, 'locus_tag', 'N/A'):<10} | "
+                f"ProtID: {getattr(feat, 'protein_accession', 'N/A'):<12} | "
+                f"Pos: {getattr(feat, 'five_end', 'N/A')} - {getattr(feat, 'three_end', 'N/A')} (Strand {getattr(feat, 'strand', 'N/A')}) | "
+                f"Seq: {seq_display}"
+            )
+        logging.info("===================================")
 
-                    #Will hold the protein amino acid sequence, if applicable
-                    aa_sequence = None
-
-                    for quality in feature['GBFeature_quals']:
-                        #Check for protein id
-                        if quality['GBQualifier_name'] == 'protein_id':
-                            protein_accession = quality['GBQualifier_value']
-                        
-                        #Check for locus tag
-                        if quality['GBQualifier_name'] == 'locus_tag':
-                            locus_tag = quality['GBQualifier_value']
-                        
-                        #Check for protein sequence
-                        if quality['GBQualifier_name'] == 'translation':
-                            sequence = quality['GBQualifier_value']
-                            if sequence == None:
-                                aa_sequence = 'None'
-                            else:
-                                aa_sequence = sequence
-
-                    if protein_accession == None:
-                        protein_accession = "None"
-                    
-                    if locus_tag == None:
-                        locus_tag = "None"
-                    
-                    if aa_sequence == None:
-                        aa_sequence = "None"
-                    
-                    feat_five_end = min(coding_start, coding_end)
-                    feat_three_end = max(coding_end, coding_start)
-                
-                    self.all_features.append(GenomeFeature(
-
-                        genome_accession=self.genome_accession,
-                        genome_fragment_name=self.name,
-                        req_limit=self.req_limit,
-                        sleep_time=self.sleep_time,
-                        strand=strand,
-                        aa_sequence=aa_sequence,
-                        coding_start=coding_start,
-                        coding_end=coding_end,
-                        five_end=feat_five_end,
-                        three_end=feat_three_end,
-                        protein_accession=protein_accession,
-                        locus_tag=locus_tag
-
-                    ))
+    def sort_all_features(self):
+        '''
+        Sorts the all_features list in-place from 5' to 3'.
+        Should be called once after all features have been loaded.
+        '''
+        self.all_features.sort(key=lambda x: x.five_end)
 
     def fetch_record(self):
         '''
-        Obtains the full genome record for the genome fragment with the feature table. Reads from file if available in the cache directory, or downloads it.
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        None
+        Obtain the full genome record as a Biopython SeqRecord.
+        Read from cache if available, otherwise download GenBank text from NCBI.
         '''
 
-        record_file = self.cache_directory + self.genome_accession + '.xml'
+        record_file = os.path.join(self.cache_directory, self.genome_accession + '.gb')
 
-        #Check if the record_file exists
+        cache_dir = os.path.dirname(record_file)
+        if cache_dir and not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, exist_ok=True)
+        
         if not os.path.exists(record_file):
+            record = None
 
             for i in range(self.req_limit):
 
                 try:
+                    handle = Entrez.efetch(
+                        db="nuccore",
+                        id=self.genome_accession,
+                        strand=1,
+                        seq_start='begin',
+                        seq_stop='end',
+                        rettype='gbwithparts',
+                        retmode='text'
+                    )
 
-                    handle = Entrez.efetch(db="nuccore", id=self.genome_accession, strand=1, seq_start='begin', seq_stop='end', rettype='gbwithparts', retmode='xml')
                     record = handle.read()
                     time.sleep(self.sleep_time)
-
                     break
 
                 except:
-
-                    print("\t\tNCBI exception raised on attempt " + str(i) + "\n\t\treattempting now for " + str(self) + "...")
+                    print("\t\tNCBI exception raised on attempt " + str(i) +
+                        "\n\t\treattempting now for " + str(self) + "...")
 
                     if i == (self.req_limit - 1):
-                            print("\t\tCould not download record after " + str(self.req_limit) + " attempts")
-            
-            if not record == None:
-                with open(record_file, 'wb') as file:
-                    file.write(record)
+                        print("\t\tCould not download record after " + str(self.req_limit) + " attempts")
 
-            
-        with open(record_file, 'rb') as file:
-            self.full_record = Entrez.read(file, 'xml')
+            if record:
+                with open(record_file, 'w', encoding='utf-8') as file:
+                    file.write(record)
+        
+        with open(record_file, 'r', encoding='utf-8') as file:
+            self.full_record = SeqIO.read(file, 'genbank')
 
     def fetch_hit_features(self, margin_limit=20, max_attempts=5, mult_factor=3):
         '''
@@ -181,6 +142,79 @@ class GenomeFragment:
             hit.fetch_feature(self.full_record)
             #hit.fetch_feature(self.full_record, margin_limit=margin_limit, max_attempts=max_attempts, mult_factor=mult_factor)    
 
+    def _seqfeature_to_genomefeature(self, feat, record):
+        """
+        Convert a Biopython SeqFeature (CDS) into a GenomeFeature object.
+        Returns None for non-CDS or unprocessable features.
+        """
+
+        if feat.type != 'CDS':
+            return None
+        
+        qualifiers = feat.qualifiers if feat.qualifiers else {}
+
+        locus_tag = qualifiers.get('locus_tag', ['None'])[0]
+        protein_accession = qualifiers.get('protein_id', ['None'])[0]
+
+        # Prefer annotated translation, otherwise try translating from nucleotide.
+        aa_sequence = qualifiers.get('translation', [None])[0]
+        if not aa_sequence:
+            try:
+                aa_sequence = str(feat.extract(record.seq).translate(to_stop=True))
+            except Exception:
+                aa_sequence = 'None'
+
+        coding_start = int(feat.location.start) + 1
+        coding_end = int(feat.location.end)
+
+        strand_val = feat.location.strand
+        if strand_val == 1:
+            strand = '+'
+            five_end = coding_start
+            three_end = coding_end
+        elif strand_val == -1:
+            strand = '-'
+            five_end = coding_end
+            three_end = coding_start
+        else:
+            strand = '?'
+            five_end = coding_start
+            three_end = coding_end
+        
+        if protein_accession == None:
+            protein_accession = "None"
+        
+        if locus_tag == None:
+            locus_tag = "None"
+
+        if aa_sequence == None:
+            aa_sequence = "None"
+
+        gf = GenomeFeature(
+            genome_accession=self.genome_accession,
+            genome_fragment_name=self.name,
+            req_limit=self.req_limit,
+            sleep_time=self.sleep_time,
+            strand=strand,
+            aa_sequence=aa_sequence,
+            coding_start=coding_start,
+            coding_end=coding_end,
+            five_end=five_end,
+            three_end=three_end,
+            protein_accession=protein_accession,
+            locus_tag=locus_tag
+        )
+
+        # Optional annotation
+        if 'product' in qualifiers and qualifiers['product']:
+            gf.product = qualifiers['product'][0]
+        
+        if 'gene' in qualifiers and qualifiers['gene']:
+            gf.gene = qualifiers['gene'][0]
+        
+        return gf
+
+
     def purge_hits(self):
         '''
         Removes any duplicates from the list of hits.
@@ -195,18 +229,19 @@ class GenomeFragment:
         '''
         
         #Remove any duplicate features so that no more than
-        print('purging hits...pre-purge: ' + str(len(self.hits)))
+        logging.info(f"Purging hits... Pre-purge count: {len(self.hits)}")  
+
+        seen_accessions = set()
         purged_hits = []
         for hit in self.hits:
-            in_purged = False
-            for p_hit in purged_hits:
-                if p_hit.protein_accession == hit.protein_accession:
-                    in_purged = True
-            if not in_purged:
+            if hit.protein_accession not in seen_accessions:
                 purged_hits.append(hit)
+                seen_accessions.add(hit.protein_accession)
+            else:
+                logging.debug(f"DUPLICATE REMOVED: {hit.protein_accession} on {hit.hit_accession}")
         
         self.hits = purged_hits
-        print('purging hits...post-purge: ' + str(len(self.hits)))
+        logging.info(f"Purging hits... Post-purge count: {len(self.hits)}")
             
         
     

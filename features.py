@@ -5,6 +5,7 @@
 
 from Bio import Entrez
 import time
+import logging
 
 
 class GenomeFeature:
@@ -62,7 +63,7 @@ class GenomeFeature:
         return to_return
     
     def __eq__(self, other):
-        if other == None:
+        if other is None:
             return False
 
         if (self.coding_start == other.coding_start and self.coding_end == other.coding_end and self.strand == other.strand) or self.locus_tag == other.locus_tag:
@@ -94,106 +95,102 @@ class AnnotatedHit(GenomeFeature):
     
     def fetch_feature(self, record, coverage_cutoff=0.25):
         '''
-        Determines the feature that corresponds to the alignment range in the genome by determining the feature that has the highest coverage over the alignment. It will pull the entire annotated genome of the genome fragmet and search through
-        all the features to determine which one contains the alignmet. 
+        Determines the feature that corresponds to the alignment range in the genome
+        by finding the CDS feature with the highest overlap/coverage with the hit.
 
         Parameters
         ----------
-        record: XML parsed object
-            The full genome record that this hit belongs to. 
+        record: SeqRecord
+            The full genome record that this hit belongs to.
         coverage_cutoff: float
-            The minimum coverage needed between the alignment and the feature for them to be assigned. 
+            The minimum coverage needed between the alignment and the feature.
 
         Returns
         -------
         None - the information is stored in the object
         '''
 
-        #Set the 5' and 3' bounds of the alignment
+        # Set the 5' and 3' bounds of the alignment
         align_five_end = min(self.align_start, self.align_end)
         align_three_end = max(self.align_start, self.align_end)
 
-        #Max coverage value
         max_coverage_val = -1
+        best_feature = None
+        best_coords = None
 
-        #Pulling all features from the Entrez results
-        for feature in record[0]['GBSeq_feature-table']:
-
-            if not feature['GBFeature_key'] == 'CDS':
-                continue
-            if not 'GBInterval_from' in feature['GBFeature_intervals'][0]:
+        for feature in record.features:
+            if feature.type != 'CDS':
                 continue
 
-            coding_start = min(int(feature['GBFeature_intervals'][0]['GBInterval_from']), int(feature['GBFeature_intervals'][0]['GBInterval_to']))
-            coding_end = max(int(feature['GBFeature_intervals'][0]['GBInterval_from']), int(feature['GBFeature_intervals'][0]['GBInterval_to']))
+            coding_start = int(feature.location.start) + 1
+            coding_end = int(feature.location.end)
 
-            #Determine which is longer: the alignment or the feature, and pulling their start and end positions. 
+            feat_start = min(coding_start, coding_end)
+            feat_end = max(coding_start, coding_end)
+
+            # Determine which is longer
             long_start = int(align_five_end)
             short_start = int(align_five_end)
 
             long_end = int(align_three_end)
             short_end = int(align_three_end)
 
-            if (align_three_end - align_five_end) > (coding_end - coding_start):
-                short_start = int(coding_start)
-                short_end = int(coding_end)
+            if (align_three_end - align_five_end) > (feat_end - feat_start):
+                short_start = int(feat_start)
+                short_end = int(feat_end)
             else:
-                long_start = int(coding_start)
-                long_end = int(coding_end)
-            
-            #The feature does not include any part of the feature (or the feature does not contain any part of the alignment), skip this feature
+                long_start = int(feat_start)
+                long_end = int(feat_end)
+
+            # No overlap
             if short_end < long_start or short_start > long_end:
                 continue
 
-            #Calculate the coverage
             feat_coverage = -1
 
-            #The coverage is 1 if the hit and feature line up exactly.            
-            #If the short one is completely included in the long one, the length of the short one divided by the length of the long one is the coverage. 
             if short_start >= long_start and short_end <= long_end:
-                feat_coverage = (short_end - short_start) / (long_end - long_start)
+                denom = (long_end - long_start)
+                if denom > 0:
+                    feat_coverage = (short_end - short_start) / denom
 
-            #If the short one "overhangs" on the five prime end, the covered region is from the begining of the long one to end of the small one. 
             elif short_start < long_start:
-                feat_coverage = (short_end - long_start) / (long_end - long_start)
-            
-            #If the short one "overhangs" on the three prime end, the covered region is from the beginning of the short one to the end of the long one
+                denom = (long_end - long_start)
+                if denom > 0:
+                    feat_coverage = (short_end - long_start) / denom
+
             elif short_end > long_end:
-                feat_coverage = (long_end - short_start) / (long_end - long_start)
-            
+                denom = (long_end - long_start)
+                if denom > 0:
+                    feat_coverage = (long_end - short_start) / denom
+
             if feat_coverage > max_coverage_val:
                 max_coverage_val = feat_coverage
-            
-            if feat_coverage > coverage_cutoff:
-                self.feature_found = True
-                self.coding_start = coding_start
-                self.coding_end = coding_end
-                
-                #Parse the protein ID, locus tag, and protein sequence from the feature table
-                for quality in feature['GBFeature_quals']:
-                    if quality['GBQualifier_name'] == 'protein_id':
-                        protein_accession = quality['GBQualifier_value']
-                        if protein_accession == None:
-                            self.protein_accession = "None"
-                        else:
-                            self.protein_accession = protein_accession
+                best_feature = feature
+                best_coords = (coding_start, coding_end)
 
-                    if quality['GBQualifier_name'] == 'locus_tag':
-                        locus_tag = quality['GBQualifier_value']
-                        if locus_tag == None:
-                            self.locus_tag = "None"
-                        else:
-                            self.locus_tag = locus_tag
-                    
-                    if quality['GBQualifier_name'] == 'translation':
-                        sequence = quality['GBQualifier_value']
-                        if sequence == None:
-                            self.aa_sequence = 'None'
-                        else:
-                            self.aa_sequence = sequence
+            if feat_coverage > 0:
+                logging.debug(
+                    f"Feature Check: {feature.qualifiers.get('locus_tag', [''])[0]} | "
+                    f"BLAST: {long_start}-{long_end} | GenBank: {short_start}-{short_end} | "
+                    f"Calculated Coverage: {feat_coverage:.4f}"
+                )
 
-                self.five_end = min(coding_end, coding_start) 
-                self.three_end = max(coding_start, coding_end)
+        if best_feature is not None and max_coverage_val > coverage_cutoff:
+            self.feature_found = True
+            self.coding_start, self.coding_end = best_coords
+
+            qualifiers = best_feature.qualifiers if best_feature.qualifiers else {}
+
+            protein_accession = qualifiers.get('protein_id', [None])[0]
+            locus_tag = qualifiers.get('locus_tag', [None])[0]
+            sequence = qualifiers.get('translation', [None])[0]
+
+            self.protein_accession = protein_accession if protein_accession is not None else "None"
+            self.locus_tag = locus_tag if locus_tag is not None else "None"
+            self.aa_sequence = sequence if sequence is not None else "None"
+
+            self.five_end = min(self.coding_start, self.coding_end)
+            self.three_end = max(self.coding_start, self.coding_end)
 
         if not self.feature_found:
             print("Error: No feature found for\n " + str(self) + '\nCoverage value:' + str(max_coverage_val))

@@ -109,7 +109,7 @@ Parameter | Description
 `search_mult_factor` | The `max_hits` is increased by this factor through each iteration if the `extensive_search` option is set to `true`. 
 `annotate` | Can be `true` or `false`. Determines if the BLAST search will return `AnnotatedHit` objects. Current functionality requires that it MUST BE `true`. 
 `extensive_search` | If `true`, multiple BLAST searches will be conducted (if neccessary) to pull all hits within the `e-value` limit. If `false`, a single BLAST search will be conducted regardless of whether all hits witin the `e-value` threshold are returned. 
-`reverse_blast` | If `true`, all return hits will be tested for true homology by BLAST searching the reference genome with the hit. 
+`reverse_blast` | If `true`, all returned hits are tested for true homology by BLAST searching the reference genome with the hit. The local reference database is built automatically via `makeblastdb` in the `./reverse_blast/` directory. <br><br>**In Remote Mode:** The script automatically finds the corresponding assembly for your input accession. It intelligently distinguishes between RefSeq and GenBank syntax (by checking for an `_` underscore, e.g., `NZ_...`) and fetches the corresponding `GCF_` or `GCA_` assembly, downloads all associated sequences, and builds the database. <br>**In Local Mode:** The script automatically scans the directory of your provided reference `data` file and uses all adjacent GenBank files to build the local assembly database.
 ---|---
 *hit\_feature\_detection* |
 `margin_limit` | The acceptable margin between the alignment positions and the positions of the annotated feature. 
@@ -121,39 +121,45 @@ Parameter | Description
 `intergenic_limit` | Maximum distance in bp allowed between two genes in an operon.
 `use_ref_limit` and `ref_limit_margin` | If `true`, the `intergenic_limit` will be determined by the max intergenic distance in the refernce operon multiplied by the margin. 
 ---|---
+**`reference` Parameters** | *(New unified reference configuration)*
+`database_mode` | Can be `"remote"` or `"local"`. Defines how the reference operon and assembly are loaded.
+`data` | **Remote mode:** The NCBI nucleotide accession of the reference genome (e.g., `NC_000913.3` or `NZ_CP115841.1`). <br>**Local mode:** The file path to the main local GenBank file (`.gb` / `.gbk`) containing the reference operon.
+`reference_genome_name` | The name of the reference assembly (required for remote mode).
+---|---
+**`input_records`** | *(New unified input configuration)*
+`type` | Defines the format of your input queries. Supported types are:<br>• `"protein_accession"`: Standard NCBI protein IDs (e.g., `NP_414878.1`).<br>• `"locus_tag"`: Gene locus tags (e.g., `b345`). Highly recommended when using `local` reference mode.<br>• `"translation"`: Raw amino acid sequence strings. <br>*Note:* The pipeline features "Input Normalization". Regardless of the input type, the script will automatically map your input to the corresponding reference feature and continue the downstream pipeline using standard protein accessions.
+`values` | An array containing the query values in the exact biological order of the reference operon (5' to 3').
+---|---
 `thread_limit` | A multithreaded approach is implemented when processing each of the Species objects. This is the maximum number of threads.
 `species_percent_id_limit` | For a species to be outputted, it must have at least one hit with an amino acid percent identity above this limit.
-`input_records` | The protein accessions for the genes in an operon. The order the genes are representative of the order of the genes in the reference genome. 
-`reference_genome_accession`| The nucleotide accession of the nucleotide record from the reference speices. This nucleotide record contains the reference operon. 
-`reference_genome_assembly`| The genome assembly accession from which the reference operon comes from. Needed to conduct the reverse BLAST locally. 
-`reference_genome_name` | The name of the reference assembly.
 `cache_dir` | The cache directory where all nucleotide records will be downloaded locally. 
+`output_dir` | The directory where all results (CSV, SVG, iTOL) will be saved.
 `color_code` | A dictionary that defines the colors for each of the genes in the reference operon. These colors are used to draw the opeon diagram for the putative operons. `intergenic` refers to features that are inserted into the operon, but were not a hit to any of the reference genes. 
 
 
 ### Output
 
-Results are outputted to a CSV and each operon is drawn to a SVG: 
+The pipeline generates a comprehensive, visually rich output folder for each run. By default, results are stored in `./output/{run_id}/` and include:
+
+**1. The Master CSV (`output.csv`)**
+A highly detailed data table containing:
+* `Species Name`, `Taxonomic ID`, and `Genome Assembly Accession`.
+* The **Structural Similarity Score** (percentage of correctly ordered operon gene pairs).
+* The **Average Amino Acid Identity (AAI)** across all genes.
+* **Per-Gene Metadata:** For each queried gene, the CSV exports its specific `nucleotide_id`, `strand`, `start`, `stop`, and calculated `protein_accession`. This is crucial for manual biological validation.
+
+**2. SVG Operon Diagrams (`/svg/`)**
+A visual genome map for every assembled operon across all species. Genes are colored according to the `color_code` dictionary in the input JSON, with intergenic (non-reference) insertions colored separately to visualize operon degradation or horizontal gene transfer.
+
+**3. Automated iTOL Datasets (`/itol/`)**
+The pipeline automatically parses the `output.csv` using NCBI Taxonomy to build phylogenetic trees and interactive annotation datasets for the [Interactive Tree Of Life (iTOL)](https://itol.embl.de/):
+* `taxonomy_tree_full.nwk` / `taxonomy_tree_genus.nwk`: The calculated Newick trees.
+* `itol_AAI_HEATMAP.txt`: Color gradient dataset for Average Amino Acid Identity.
+* `itol_STRUCT_HEATMAP.txt`: Color gradient dataset for Operon Structural Similarity.
+* `itol_PROTEIN_HEATMAP.txt`: Individual heatmaps for each reference gene.
+* `itol_POPUP_INFO.txt`: An interactive HTML popup for each leaf in the tree, displaying the exact assembly accessions, metadata, and individual percent identities.
 
 ### Usage
 Once the `conda` environment is set up, the script can be ran via command line: <br><br>
 `python operon_conserve_detect.py [input file name].json` <br> <br>
-where the input file name is the name of the input file, not including the directory. The input file is expected to be in `/input/`. 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+where the input file name is the name of the input file, not including the directory. The input file is expected to be in `/input/`.

@@ -1,3 +1,9 @@
-
-# macOS Finder icon metadata files that break Windows checkouts
-Icon?
+__pycache__/
+cache*/
+output*/
+reverse_blast/
+local_blast_bin/
+lokale_db/
+pipeline_test_log.txt
+*.xml
+*.fasta

@@ -9,6 +9,7 @@ from features import AnnotatedHit
 import re
 import os
 import math
+import logging
 
 class Species:
     '''
@@ -146,6 +147,7 @@ class Species:
         for i in range(len(reference_operon)-1):
             ref_pairs.append((reference_operon[i], reference_operon[i+1]))
 
+        logging.info(f"    [Struct] Perfect Reference Pairs: {ref_pairs}")
 
         #Holds how many times each reference query got a hit in the species
         species_query_count = {}
@@ -186,6 +188,8 @@ class Species:
                         species_pairs.append(pair)
         
 
+        logging.info(f"    [Struct] Found Pairs in {self.species_name}: {species_pairs}")
+
         #Holds the weighted number of matched pairs
         weighted_num_match = 0
 
@@ -205,12 +209,15 @@ class Species:
             
             #Adjust the weighted total
             if max_possible_occur > 0:
-                weighted_num_match = weighted_num_match + (num_occur/max_possible_occur)
+                added_weight = (num_occur/max_possible_occur)
+                weighted_num_match = weighted_num_match + added_weight
+                logging.info(f"    [Struct] Pair {ref_pair} Math: Found {num_occur} / Max {max_possible_occur} -> Added Weight: {added_weight:.2f}")
+            else:
+                logging.info(f"    [Struct] Pair {ref_pair} Math: Max possible is 0 -> Added Weight: 0.00")
 
-                        
-        #Calculate the score
+
         final_score = weighted_num_match/len(ref_pairs)
-
+            
         self.sim_score = final_score
 
 
@@ -277,10 +284,20 @@ class Species:
 
         for frag in self.genome_fragments:
             frag_name = frag.species_name
-            if len(frag_name) < len(current_name):
+
+            if frag_name is None:
+                continue
+
+            if current_name is None or current_name == "Unknown Species":
                 current_name = frag_name
-        
-        self.species_name =  re.sub("[^0-9a-zA-Z]+", "_", current_name)
+
+            elif len(frag_name) < len(current_name):
+                current_name = frag_name
+
+        if current_name is None:
+            self.species_name = f"Unknown_Species_{self.assembly_accession}"
+        else:
+            self.species_name =  re.sub("[^0-9a-zA-Z]+", "_", current_name)
     
 
     def draw_figure(self, color_code={}, output_dir='./output/svg/'):
@@ -330,17 +347,19 @@ class Species:
 
                 for feat in operon.features:
 
-                    #Pull all the paramaters for the current feature and adjust the start/end of the diagram if needed
-                    start = feat.five_end
+                    #Pull all the paramaters for the current feature
+                    raw_start = int(feat.five_end)
+                    raw_end = int(feat.three_end)
+                    
+                    # BIOPYTHON FIX: start must ALWAYS be <= end for FeatureLocation
+                    start = min(raw_start, raw_end)
+                    end = max(raw_start, raw_end)
 
-                    if int(start) < t_start:
-                        t_start = int(start)
-
-
-                    end = feat.three_end
-
-                    if int(end) > t_end:
-                        t_end = int(end)
+                    # Adjust the start/end of the diagram if needed
+                    if start < t_start:
+                        t_start = start
+                    if end > t_end:
+                        t_end = end
 
 
                     strand = 0

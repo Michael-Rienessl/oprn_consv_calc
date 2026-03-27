@@ -1,71 +1,58 @@
 {
-    
-    "entrez": [{
-    
-        "request_limit" : 15,
-        "sleep_time": 5,
-        "email" : "EMAIL",
-        "api_key" : "KEY"
-        
-    }],
-
-    "blast" : [{
-
-		"blast_type" : "local",
-		"local_db_path" : "/Volumes/Issac_Ext/SOA/gammaproteobac_nucl/gamma_database_nucl",
-		"tax_include" : ["1236"],
-		"tax_exclude" : [],
-		"database" : "ref_prok_rep_genomes",
-    	"e_val" : 10E-10,
-    	"coverage_min": 0.5,
-		"max_hits": 20000,
-		"max_attempts": 3,
-		"search_mult_factor": 2,
-		"annotate": true,
-		"extensive_search": true,
-		"reverse_blast": true
-
-    }],
-
-    "hit_feature_detection" : [{
-
-		"margin_limit": 5,
-		"max_attempts": 10,
-		"mult_factor" : 3
-
-    }],
-
-    "operon_assembly" : [{
-		"feature_limit": 3,
-		"intergenic_limit": 150,
-		"use_ref_limit" : true,
-		"ref_limit_margin" : 0.5    	
-
-	}],
-	
-	"thread_limit": 10,
-
-	"species_percent_id_limit": 0.45,
-
-	"input_records" : ["WP_000373826.1", "WP_000173586.1", "WP_000821694.1", "WP_000562692.1", "WP_000778642.1"],
-
-	"reference_genome_accession" : " NZ_CP025937.1",
-
-	"reference_genome_assembly" : "NZ_00000000",
-
-	"reference_genome_name": "Vibrio_cholerae_strain_A1552",
-
-	"cache_dir": "./cache/",
-	
-	"color_code":[{
-
-		"intergenic":"#000000",
-		"WP_000373826.1":"#ffa200",
-		"WP_000173586.1":"#68ff03",
-		"WP_000821694.1":"#05eeff",
-		"WP_000562692.1":"#4c05ff",
-		"WP_000778642.1":"#ff05ea"
-
-	}]
-        
+  "entrez": [{
+    "request_limit": 3,
+    "sleep_time": 1.0,
+    "email": "YOUR_EMAIL@example.com",
+    "api_key": "YOUR_API_KEY"
+  }],
+  "blast": [{
+    "tax_include": [2716351],
+    "tax_exclude": [],
+    "database": "nr",             
+    "blast_type": "remote",
+    "local_db_path": "",
+    "e_val": 1e-10,                
+    "coverage_min": 0.8,         
+    "max_hits": 5,
+    "max_attempts": 1,
+    "search_mult_factor": 1,
+    "annotate": true,
+    "extensive_search": true,
+    "reverse_blast": true
+  }],
+  "hit_feature_detection": [{
+    "margin_limit": 5,
+    "max_attempts": 3,
+    "mult_factor": 3
+  }],
+  "operon_assembly": [{
+    "feature_limit": 1,
+    "intergenic_limit": 150,
+    "use_ref_limit": true,
+    "ref_limit_margin": 0.5
+  }],
+  "thread_limit": 4,
+  "species_percent_id_limit": 0.45,
+  "output_dir": "output/test_edge_case_2/",
+  "cache_dir": "cache_test_edge_case/",
+  
+  "reference": {
+    "database_mode": "remote",
+    "data": "NC_005340.1",
+    "reference_genome_name": "Rhodopseudomonas_palustris_Test"
+  },
+  "input_records": {
+    "type": "protein_accession",
+    "values": [
+        "NP_958095.1",
+        "NP_958096.1",
+        "NP_958094.1"
+    ]
+  },
+  "color_code": [{
+    "intergenic": "#000000",
+    "NP_958095.1": "#ff0000",
+    "NP_958094.1": "#ff0002",
+    "NP_958096.1": "#ff0001"
+  }]
 }
