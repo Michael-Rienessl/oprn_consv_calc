@@ -127,7 +127,7 @@ Parameter | Description
 `reference_genome_name` | The name of the reference assembly (required for remote mode).
 ---|---
 **`input_records`** | *(New unified input configuration)*
-`type` | Defines the format of your input queries. Supported types are:<br>• `"protein_accession"`: Standard NCBI protein IDs (e.g., `NP_414878.1`).<br>• `"locus_tag"`: Gene locus tags (e.g., `b345`). Highly recommended when using `local` reference mode.<br>• `"translation"`: Raw amino acid sequence strings. <br>*Note:* The pipeline features "Input Normalization". Regardless of the input type, the script will automatically map your input to the corresponding reference feature and continue the downstream pipeline using standard protein accessions.
+`type` | Defines the format of your input queries. Supported types are:<br>• `"protein_accession"`: Standard NCBI protein IDs (e.g., `NP_414878.1`).<br>• `"locus_tag"`: Gene locus tags (e.g., `b345`).<br>• `"translation"`: Raw amino acid sequence strings. <br>*Note:* The pipeline features "Input Normalization". Regardless of the input type, the script will automatically map your input to the corresponding reference feature and continue the downstream pipeline using standard protein accessions.
 `values` | An array containing the query values in the exact biological order of the reference operon (5' to 3').
 ---|---
 `thread_limit` | A multithreaded approach is implemented when processing each of the Species objects. This is the maximum number of threads.
