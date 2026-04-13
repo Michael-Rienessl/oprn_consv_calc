@@ -13,6 +13,47 @@ class Operon:
         self.genome_accession =genome_accession
         self.genome_features = genome_features
         self.strand = strand
+
+        self.local_sim = 0.0
+        self.local_aai = 0.0
+
+    def calculate_local_stats(self, reference_pairs):
+        '''
+        Calculates local structural similarity (SIM)
+        and average amino acid identity (AAI) just for this fragment.
+        '''
+
+        #1 Calculate local AAI (average of all AnnotedHits in this operon)
+        hits = [f for f in self.features if isinstance(f, AnnotatedHit)]
+        if hits:
+            self.local_aai = sum(float(h.percent_identity) for h in hits) / len(hits)
+        else:
+            self.local_aai = 0.0
+
+        #2 Calculate local SIM
+        # Check how many reference pairs exist in dies specific fragment
+        if not reference_pairs:
+            self.local_sim = 0.0
+            return
+        
+        found_pairs_count = 0
+
+        # Extract all pairs of query accessions that are directly adjacent in this operon
+        # (Intergenic features are ignored because they do not break the chain)
+        query_sequence = [f.query_accession for f in self.features if isinstance(f, AnnotatedHit)]
+
+        local_pairs = []
+        for i in range(len(query_sequence) - 1):
+            local_pairs.append((query_sequence[i], query_sequence[i+1]))
+            # Also count reverse pairs (since orientation in the genome can vary)
+            local_pairs.append((query_sequence[i+1], query_sequence[i]))
+
+        for ref_p in reference_pairs:
+            if ref_p in local_pairs:
+                found_pairs_count += 1
+
+        # Local SIM = Found pairs in this fragment / Total reference pairs
+        self.local_sim = found_pairs_count / len(reference_pairs)
     
     def add_feature(self, feature):
         '''

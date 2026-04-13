@@ -113,10 +113,11 @@ def read_taxids(csv_path: Path) -> List[int]:
     taxids = []
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        if "Taxonomic ID" not in reader.fieldnames:
-            raise KeyError(f"CSV has no column 'Taxonomic ID'. Columns: {reader.fieldnames}")
+        # Updated to match new OCD header 'TaxID'
+        if "TaxID" not in reader.fieldnames:
+            raise KeyError(f"CSV has no column 'TaxID'. Columns: {reader.fieldnames}")
         for row in reader:
-            v = str(row["Taxonomic ID"]).strip()
+            v = str(row["TaxID"]).strip()
             if v:
                 taxids.append(int(v))
     return sorted(set(taxids))
@@ -276,50 +277,29 @@ def build_taxonomy_trees(csv_path: Path, outdir: Path, sleep_s: float) -> Tuple[
 
 def detect_metric_columns(df: pd.DataFrame) -> Tuple[str, str, List[str]]:
     """
-    Detect the core metrics and per-protein columns.
+    Directly assigns the fixed columns from the updated OCD output.
+    
+    Returns:
+        best_sim_col: 'Best_Operon_SIM'
+        total_sim_col: 'Total_Genomic_SIM'
+        best_op_protein_cols: List of 'Best_Op_..._AAI' columns
     """
-    aai_candidates = [
-        "Average Percent Amino Acid Identity",
-        "AAI",
-        "AAI_mean",
-        "Average Amino Acid Identity",
-    ]
-    struct_candidates = [
-        "Structural Similarity",
-        "Operon Structural Similarity",
-        "Operon structural similarity",
-        "Structure Similarity",
-        "Structural_similarity",
-    ]
+    # 1. Direct assignment of the SIM columns
+    best_sim_col = 'Best_Operon_SIM'
+    total_sim_col = 'Total_Genomic_SIM'
 
-    aai_col = next((c for c in aai_candidates if c in df.columns), None)
-    struct_col = next((c for c in struct_candidates if c in df.columns), None)
+    # Validation: Ensure these fixed columns actually exist in the CSV
+    if best_sim_col not in df.columns or total_sim_col not in df.columns:
+        raise KeyError(f"Required columns '{best_sim_col}' or '{total_sim_col}' missing. Check your CSV header.")
 
-    if aai_col is None:
-        raise KeyError("Could not find an AAI column in the CSV.")
-    if struct_col is None:
-        raise KeyError("Could not find a structural similarity column in the CSV.")
+    # 2. Identify the specific AAI columns for each protein in the best operon
+    # This matches the pattern header.append(f'Best_Op_{q_acc}_AAI') from OCD
+    best_op_protein_cols = [c for c in df.columns if c.startswith("Best_Op_") and c.endswith("_AAI")]
 
-    metadata_cols = {
-        "Species Name",
-        "Taxonomic ID",
-        "Genome Assembly Accession",
-        "Sequence Accessions",
-        "taxid",
-        "leaf_id",
-        aai_col,
-        struct_col,
-    }
+    if not best_op_protein_cols:
+        print("Warning: No individual protein AAI columns (Best_Op_..._AAI) detected.")
 
-    protein_cols = [c for c in df.columns if c not in metadata_cols]
-
-    valid_protein_cols = []
-    for col in protein_cols:
-        converted = df[col].apply(pct_to_float)
-        if converted.notna().any():
-            valid_protein_cols.append(col)
-
-    return aai_col, struct_col, valid_protein_cols
+    return best_sim_col, total_sim_col, best_op_protein_cols
 
 
 def write_heatmap_header(
@@ -346,36 +326,32 @@ def write_heatmap_header(
     handle.write("DATA\n")
 
 
-def write_aai_heatmap(df_ok: pd.DataFrame, outpath: Path, aai_col: str):
+def write_best_sim_heatmap(df_ok: pd.DataFrame, outpath: Path, best_sim_col: str):
     with outpath.open("w", encoding="utf-8") as f:
         write_heatmap_header(
             f,
-            dataset_label="AAI (%)",
+            dataset_label="Best Operon SIM (%)",
             color="#1f4db3",
-            field_labels=["AAI"],
-            min_value=0,
-            max_value=100,
+            field_labels=["Best SIM"],
         )
         for _, row in df_ok.iterrows():
-            aai = pct_to_float(row[aai_col])
-            if pd.notna(aai):
-                f.write(f"{row['leaf_id']}\t{aai:.4f}\n")
+            val = pct_to_float(row[best_sim_col])
+            if pd.notna(val):
+                f.write(f"{row['leaf_id']}\t{val:.4f}\n")
 
 
-def write_struct_heatmap(df_ok: pd.DataFrame, outpath: Path, struct_col: str):
+def write_total_sim_heatmap(df_ok: pd.DataFrame, outpath: Path, total_sim_col: str):
     with outpath.open("w", encoding="utf-8") as f:
         write_heatmap_header(
             f,
-            dataset_label="Operon Structural Similarity (%)",
+            dataset_label="Total Genomic SIM (%)",
             color="#b012e6",
-            field_labels=["Structure"],
-            min_value=0,
-            max_value=100,
+            field_labels=["Total SIM"],
         )
         for _, row in df_ok.iterrows():
-            struct = pct_to_float(row[struct_col])
-            if pd.notna(struct):
-                f.write(f"{row['leaf_id']}\t{struct:.4f}\n")
+            val = pct_to_float(row[total_sim_col])
+            if pd.notna(val):
+                f.write(f"{row['leaf_id']}\t{val:.4f}\n")
 
 
 def write_protein_heatmap(df_ok: pd.DataFrame, outpath: Path, protein_cols: List[str]):
@@ -405,43 +381,50 @@ def write_protein_heatmap(df_ok: pd.DataFrame, outpath: Path, protein_cols: List
 def write_popup_info(
     df_ok: pd.DataFrame,
     outpath: Path,
-    aai_col: str,
-    struct_col: str,
+    best_sim_col: str,
+    total_sim_col: str,
     protein_cols: List[str],
 ):
+    # Detect count columns automatically
+    count_cols = [c for c in df_ok.columns if c.startswith("Total_Count_")]
+
     with outpath.open("w", encoding="utf-8") as f:
         f.write("POPUP_INFO\n")
         f.write("SEPARATOR TAB\n")
         f.write("DATA\n")
 
         for _, row in df_ok.iterrows():
-            species = str(row.get("Species Name", "NA"))
-            taxid = row.get("Taxonomic ID", "NA")
-            assembly = str(row.get("Genome Assembly Accession", "NA"))
-
-            aai = pct_to_float(row[aai_col])
-            struct = pct_to_float(row[struct_col])
+            species = str(row.get("Species", "NA"))
+            taxid = row.get("TaxID", "NA")
+            
+            best_sim = pct_to_float(row[best_sim_col])
+            total_sim = pct_to_float(row[total_sim_col])
 
             lines = [
                 f"<b>{html.escape(species)}</b>",
                 f"TaxID: {html.escape(str(taxid))}",
-                f"Assembly: {html.escape(assembly)}",
-                f"AAI: {aai:.2f}%" if pd.notna(aai) else "AAI: NA",
-                f"Operon Structural Similarity: {struct:.2f}%" if pd.notna(struct) else "Operon Structural Similarity: NA",
+                f"Best Operon SIM: {best_sim:.2f}%" if pd.notna(best_sim) else "Best SIM: NA",
+                f"Total Genomic SIM: {total_sim:.2f}%" if pd.notna(total_sim) else "Total SIM: NA",
             ]
 
+            # Add Gene Identites from Best Operon
             if protein_cols:
-                lines.append("<br><b>Reference protein values</b>")
+                lines.append("<br><b>Best Operon Gene Identities:</b>")
                 for col in protein_cols:
                     val = pct_to_float(row[col])
-                    if pd.notna(val):
-                        lines.append(f"{html.escape(col)}: {val:.2f}%")
-                    else:
-                        lines.append(f"{html.escape(col)}: NA")
+                    name = col.replace("Best_Op_", "").replace("_AAI", "")
+                    lines.append(f"{html.escape(name)}: {val:.2f}%" if pd.notna(val) else f"{name}: NA")
+
+            # Add Genomic Counts
+            if count_cols:
+                lines.append("<br><b>Genomic Gene Counts:</b>")
+                for col in count_cols:
+                    val = row[col]
+                    name = col.replace("Total_Count_", "")
+                    lines.append(f"{html.escape(name)}: {val}")
 
             popup_html = "<br>".join(lines)
             title = html.escape(species)
-
             f.write(f"{row['leaf_id']}\t{title}\t{popup_html}\n")
 
 
@@ -450,20 +433,15 @@ def load_and_match(tree_path: Path, csv_path: Path) -> Tuple[pd.DataFrame, List[
     labels = extract_leaf_labels(newick)
     taxid_to_leaf = build_taxid_to_leafid(labels)
 
-    if not taxid_to_leaf:
-        raise ValueError(
-            "Could not extract any TaxIDs from tree leaf labels. "
-            "Expected labels like 'Species_name__taxid12345'."
-        )
-
     df = pd.read_csv(csv_path)
 
-    if "Taxonomic ID" not in df.columns:
-        raise KeyError("CSV must contain the column 'Taxonomic ID'.")
-    if "Species Name" not in df.columns:
-        raise KeyError("CSV must contain the column 'Species Name'.")
+    # Updated to match new OCD header 'TaxID' and 'Species'
+    if "TaxID" not in df.columns:
+        raise KeyError("CSV must contain the column 'TaxID'.")
+    if "Species" not in df.columns:
+        raise KeyError("CSV must contain the column 'Species'.")
 
-    df["taxid"] = df["Taxonomic ID"].astype(int)
+    df["taxid"] = df["TaxID"].astype(int)
     df["leaf_id"] = df["taxid"].map(taxid_to_leaf)
 
     return df, labels
@@ -509,31 +487,36 @@ def main():
 
     # 2) Build iTOL datasets from full tree
     df, labels = load_and_match(full_tree_path, csv_path)
-    aai_col, struct_col, protein_cols = detect_metric_columns(df)
+    best_sim_col, total_sim_col, best_op_protein_cols = detect_metric_columns(df)
 
-    missing = df[df["leaf_id"].isna()][["Species Name", "taxid"]]
+    missing = df[df["leaf_id"].isna()][["Species", "taxid"]]
     if len(missing) > 0:
         print("WARNING: Some TaxIDs from the CSV were not found in the tree (showing up to 20 rows):")
         print(missing.head(20).to_string(index=False))
 
     df_ok = df.dropna(subset=["leaf_id"]).copy()
 
-    aai_path = outdir / "itol_AAI_HEATMAP.txt"
-    struct_path = outdir / "itol_STRUCT_HEATMAP.txt"
+    # Define paths
+    best_sim_path = outdir / "itol_BEST_SIM_HEATMAP.txt"
+    total_sim_path = outdir / "itol_TOTAL_SIM_HEATMAP.txt"
     protein_path = outdir / "itol_PROTEIN_HEATMAP.txt"
     popup_path = outdir / "itol_POPUP_INFO.txt"
 
-    write_aai_heatmap(df_ok, aai_path, aai_col)
-    write_struct_heatmap(df_ok, struct_path, struct_col)
-    write_protein_heatmap(df_ok, protein_path, protein_cols)
-    write_popup_info(df_ok, popup_path, aai_col, struct_col, protein_cols)
+    # Hier werden die Dateien geschrieben - achte auf die Variablennamen!
+    write_best_sim_heatmap(df_ok, best_sim_path, best_sim_col)
+    write_total_sim_heatmap(df_ok, total_sim_path, total_sim_col)
+    
+    # Korrektur: Nutze best_op_protein_cols statt protein_cols
+    write_protein_heatmap(df_ok, protein_path, best_op_protein_cols)
+    write_popup_info(df_ok, popup_path, best_sim_col, total_sim_col, best_op_protein_cols)
 
-    print(f"Wrote: {aai_path}")
-    print(f"Wrote: {struct_path}")
-    if protein_cols:
+    # Korrektur der Print-Ausgaben am Ende
+    print(f"Wrote: {best_sim_path}")
+    print(f"Wrote: {total_sim_path}")
+    if best_op_protein_cols: # Hier ebenfalls anpassen
         print(f"Wrote: {protein_path}")
         print("Protein columns included in heatmap:")
-        for col in protein_cols:
+        for col in best_op_protein_cols: # Und hier
             print(f"  - {col}")
     else:
         print("No per-protein columns detected; protein heatmap was not populated.")

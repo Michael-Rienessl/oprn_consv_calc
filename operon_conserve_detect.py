@@ -962,142 +962,165 @@ def load_input_file(filename):
     os.makedirs(cache_dir, exist_ok=True)
     
 
-
-def write_all_out(filename='output.csv'):
+def write_all_out(species_list, query_accessions, output_path):
     '''
-    Creates the output directory and outputs everything to that folder. The final output directory will have the following:
-        - A CSV file holding the species name, structure similarity score, percent id for each reference gene, taxid, and assembly accession
-        - An exact copy of the input JSON
-        - A folder named SVG that will hold the diagrams for each species.  
+    Writes the results into two separate CSV files: 
+    1. Summary: Best operon and genomic totals per species.
+    2. Detailed: Every single operon fragment found.
+    '''
+    import csv
+    import os
 
-    Parameters
-    ----------
-    filename: string
-        The output file that will be written in the output/ directory
+    summary_file = output_path.replace(".csv", "_summary.csv")
+
+    # WRITE SUMMARY FILE
+    with open(summary_file, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Build Header
+        header = ['Species', 'TaxID', 'Best_Operon_SIM', 'Total_Genomic_SIM', 'Best_Operon_Avg_AAI', 'Global_Total_Avg_AAI']
+        
+        # AAI of each gene IN the best operon
+        for q_acc in query_accessions:
+            header.append(f'Best_Op_{q_acc}_AAI')
+            
+        # Total counts in the whole genome
+        for q_acc in query_accessions:
+            header.append(f'Total_Count_{q_acc}')
+            
+        header.extend(['Assembly_Accession', 'Nucleotide_ID'])
+        writer.writerow(header)
+
+        for sp in species_list:
+            row = []
+            row.append(sp.species_name)
+            row.append(getattr(sp, 'taxid', 'N/A'))
+            
+            # Best Operon Stats
+            if sp.best_operon:
+                row.append(f"{sp.best_operon.local_sim * 100:.1f}%")
+                row.append(f"{sp.sim_score * 100:.1f}%")
+                row.append(f"{sp.best_operon.local_aai * 100:.1f}%")
+            else:
+                row.extend(["0.0%", f"{sp.sim_score * 100:.1f}%", "0.0%"])
+
+            # Global Total Average AAI
+            global_aai = getattr(sp, 'total_avg_aai_calculated', 0.0)
+            row.append(f"{global_aai * 100:.2f}%")
+
+            # --- NEW LOGIC: AAI for all Queries from best Operon ---
+            for q_acc in query_accessions:
+                aai_val = "N/A"
+                if sp.best_operon:
+                    # Search specifically in the best operon's features
+                    for feat in sp.best_operon.features:
+                        if hasattr(feat, 'query_accession') and feat.query_accession == q_acc:
+                            aai_val = f"{feat.percent_identity * 100:.1f}%"
+                            break
+                row.append(aai_val)
+
+            # Total Counts per Query (Genomic wide)
+            for q_acc in query_accessions:
+                count = sp.query_hits_counts.get(q_acc, 0)
+                row.append(count)
+
+            # Metadata from best operon
+            if sp.best_operon:
+                row.append(getattr(sp, 'assembly_accession', 'N/A'))
+                row.append(sp.best_operon.genome_accession)
+            else:
+                row.append(getattr(sp, 'assembly_accession', 'N/A'))
+                row.append('N/A')
+
+            writer.writerow(row)
+        
+def append_detailed_out(sp, query_accessions, detailed_path):
+    '''
+    Appends the operon fragments of a single species to the detailed CSV.
+    '''
+    import csv
+    file_exists = os.path.isfile(detailed_path)
     
-    Returns
-    -------
-    None
-    '''
-
-    #Set the full path to the output file
-    filename = output_dir + filename
-
-    #Make the output stream to the file
-    ofile_stream = csv.writer(open(filename, mode='w'))
-
-    #Setup and write the header row to the file 
-    header_row = ['Species Name','Structural Similarity', 'Average Percent Amino Acid Identity']
-
-    for record in input_records:
-        header_row.append(str(record))
-
-    header_row.append('Taxonomic ID')
-    header_row.append('Genome Assembly Accession')
-
-    for query in input_records:
-        header_row.append(f"{query}_nucleotide_id")
-        header_row.append(f"{query}_strand")
-        header_row.append(f"{query}_start")
-        header_row.append(f"{query}_stop")
-        header_row.append(f"{query}_protein_accession")
-
-    ofile_stream.writerow(header_row)
-
-    #Write info for all the species in the file
-    for sp in species:
-
-        if len(sp.query_percent_ids) > 0:
-            mean_aai = sum(sp.query_percent_ids.values()) / len(sp.query_percent_ids)
-        else:
-            mean_aai = 0.0
-
-        sp_row = [
-            f"{sp.species_name}<{sp.assembly_accession}>", 
-            f"{sp.sim_score * 100}%", 
-            f"{mean_aai * 100}%"
-        ]
-
-        #Pulls the query percent IDs
-        for query in input_records:
-            percent = sp.query_percent_ids.get(query, 0.0)
-            sp_row.append(f"{percent * 100}%")
+    with open(detailed_path, 'a', newline='') as csvfile:
+        writer = csv.writer(csvfile)
         
-        #Pulls the taxid
-        sp_row.append(sp.taxid)
+        if not file_exists:
+            header = ['Species', 'Fragment_SIM', 'Fragment_Avg_AAI']
+            for q_acc in query_accessions:
+                header.extend([f'{q_acc}_AAI', f'{q_acc}_Accession', f'{q_acc}_Start', f'{q_acc}_Stop', f'{q_acc}_Strand'])
+            writer.writerow(header)
 
-        #Pulls the genome assembly accession
-        sp_row.append(sp.assembly_accession)
-        
-        hit_metadata = getattr(sp, 'hit_metadata', {})
-
-        # Die extrahierten Metadaten in exakt der Reihenfolge des Headers an die Zeile anhängen
-        for query in input_records:
-            meta = hit_metadata.get(query, {})
-            sp_row.append(str(meta.get('nucleotide_id', 'None')))
-            sp_row.append(str(meta.get('strand', 'None')))
-            sp_row.append(str(meta.get('start', 'None')))
-            sp_row.append(str(meta.get('stop', 'None')))
-            sp_row.append(str(meta.get('protein_accession', 'None')))
-        
-        #Write row to file
-        ofile_stream.writerow(sp_row)
+        for frag in sp.genome_fragments:
+            for operon in frag.operons:
+                row = [sp.species_name, f"{operon.local_sim * 100:.1f}%", f"{operon.local_aai * 100:.1f}%"]
+                for q_acc in query_accessions:
+                    found_hit = None
+                    for feat in operon.features:
+                        if hasattr(feat, 'query_accession') and feat.query_accession == q_acc:
+                            found_hit = feat
+                            break
+                    if found_hit:
+                        row.extend([f"{found_hit.percent_identity* 100:.1f}%", found_hit.protein_accession, 
+                                   found_hit.five_end, found_hit.three_end, found_hit.strand])
+                    else:
+                        row.extend(['N/A', 'N/A', 'N/A', 'N/A', 'N/A'])
+                writer.writerow(row)
 
 def run_itol_pipeline():
-    """
-    Run the iTOL tree/dataset generation script after output.csv has been written.
+        """
+        Run the iTOL tree/dataset generation script after output.csv has been written.
 
-    The iTOL files are written into a folder named 'itol' next to the main output.csv.
-    """
+        The iTOL files are written into a folder named 'itol' next to the main output.csv.
+        """
 
-    global output_dir
-    global EMAIL
-    global E_API
+        global output_dir
+        global EMAIL
+        global E_API
 
-    # Path to the CSV written by write_all_out()
-    output_csv = os.path.join(output_dir, "output.csv")
+        # Path to the CSV written by write_all_out()
+        output_csv = os.path.join(output_dir, "output_summary.csv")
 
-    if not os.path.exists(output_csv):
-        print("iTOL pipeline skipped: output.csv was not found.")
-        return
+        if not os.path.exists(output_csv):
+            print("iTOL pipeline skipped: output_summary.csv was not found.")
+            return
 
-    # Create output_dir/itol
-    itol_outdir = os.path.join(output_dir, "itol")
-    os.makedirs(itol_outdir, exist_ok=True)
+        # Create output_dir/itol
+        itol_outdir = os.path.join(output_dir, "itol")
+        os.makedirs(itol_outdir, exist_ok=True)
 
-    # Path to the iTOL script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    itol_script = os.path.join(script_dir, "itol_pipeline", "build_itol_tree_and_datasets.py")
+        # Path to the iTOL script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        itol_script = os.path.join(script_dir, "itol_pipeline", "build_itol_tree_and_datasets.py")
 
-    if not os.path.exists(itol_script):
-        print("iTOL pipeline skipped: build_itol_tree_and_datasets.py was not found.")
-        print("Expected at:", itol_script)
-        return
+        if not os.path.exists(itol_script):
+            print("iTOL pipeline skipped: build_itol_tree_and_datasets.py was not found.")
+            print("Expected at:", itol_script)
+            return
 
-    cmd = [
-        sys.executable,
-        itol_script,
-        output_csv,
-        "--email", EMAIL,
-        "--outdir", itol_outdir
-    ]
+        cmd = [
+            sys.executable,
+            itol_script,
+            output_csv,
+            "--email", EMAIL,
+            "--outdir", itol_outdir
+        ]
 
-    # Only pass API key if available
-    if E_API and str(E_API).strip() != "":
-        cmd.extend(["--api-key", E_API])
+        # Only pass API key if available
+        if E_API and str(E_API).strip() != "":
+            cmd.extend(["--api-key", E_API])
 
-    print("Running iTOL pipeline...")
-    print("Command:", " ".join(cmd))
+        print("Running iTOL pipeline...")
+        print("Command:", " ".join(cmd))
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    if proc.returncode != 0:
-        print("iTOL pipeline failed.")
-        print(proc.stdout)
-        print(proc.stderr)
-    else:
-        print("iTOL pipeline finished successfully.")
-        print(proc.stdout)
+        if proc.returncode != 0:
+            print("iTOL pipeline failed.")
+            print(proc.stdout)
+            print(proc.stderr)
+        else:
+            print("iTOL pipeline finished successfully.")
+            print(proc.stdout)
 
 def pre_process_fragments():
     '''
@@ -1272,7 +1295,9 @@ def align_input_records_to_biology():
         for feat in ref_features:
             target_id = None 
             if input_record_type == "locus_tag" and getattr(feat, 'locus_tag', None) in input_records:
-                target_id = getattr(feat, 'protein_accession', feat.locus_tag)
+                target_id = getattr(feat, 'protein_accession', None)
+                if target_id in [None, 'None', '']:
+                    target_id = getattr(feat, 'locus_tag', None)
                 
             elif input_record_type == "protein_accession" and getattr(feat, 'protein_accession', None) in input_records:
                 target_id = feat.protein_accession
@@ -1395,7 +1420,7 @@ def process_reference():
             "A biological operon is not possible in this configuration. Please check your JSON input."
         )
 
-    align_input_records_to_biology
+    align_input_records_to_biology()
 
 def get_reference_intergenic_distance():
     '''
@@ -1453,8 +1478,7 @@ def calculate_percent_ids(sp):
     # Iterate through all of the features in every fragment in each species
     for frag in sp.genome_fragments:
 
-        if not hasattr(sp, 'hit_metadata'):
-            sp.hit_metadata = {}
+        # Metadata logic was moved to write_all_out to keep this function focused on AAI calculation
 
         for feat in frag.hits:
             
@@ -1464,32 +1488,6 @@ def calculate_percent_ids(sp):
             # Hold the reference sequence
             ref_seq = None
             query_id = str(feat.query_accession).strip()
-
-            if query_id not in sp.hit_metadata:
-                # 1. Nucleotide ID (plasmide/chromosom)
-                nucl_id = getattr(frag, 'genome_accession', getattr(frag, 'genome_fragment_accession', 'N/A'))
-                
-                # 2. Positions and strand (Fallback to location object if not directly available on feature)
-                f_start = getattr(feat, 'five_end', getattr(feat, 'align_start', 'N/A'))
-                f_stop = getattr(feat, 'three_end', getattr(feat, 'align_end', 'N/A'))
-                f_strand = getattr(feat, 'strand', 'N/A')
-
-                f_prot = getattr(feat, 'protein_accession', getattr(feat, 'hit_accession', 'N/A'))
-
-                # Fallback: Sometimes data might be in location object
-                if hasattr(feat, 'location') and feat.location:
-                    if f_start == 'N/A': f_start = str(feat.location.start)
-                    if f_stop == 'N/A': f_stop = str(feat.location.end)
-                    if f_strand == 'N/A': f_strand = str(feat.location.strand)
-
-                # Write into hit_metadata for spezies
-                sp.hit_metadata[query_id] = {
-                    'nucleotide_id': str(nucl_id),
-                    'strand': str(f_strand),
-                    'start': str(f_start),
-                    'stop': str(f_stop),
-                    'protein_accession': str(f_prot)
-                }
 
             for ref_feat in ref_features:
 
@@ -1546,17 +1544,15 @@ def calculate_percent_ids(sp):
                 feat.percent_identity = 0.0
                 continue
 
-            # --- THE FIX: We only calculate the very first (best) alignment to avoid combinatorial explosion ---
+            # We only calculate the very first (best) alignment
             alignments = aligner.align(ref_seq, feat_seq)
 
             try:
                 align = next(iter(alignments))
             except StopIteration:
-                # logging.info(f"    Gene {query_id} Alignment: No alignments found.")
                 feat.percent_identity = 0.0
                 continue
 
-            # Grab the first optimal alignment
             align = alignments[0]
             
             formatted_alignment = format(align).split("\n")
@@ -1568,7 +1564,6 @@ def calculate_percent_ids(sp):
             size_adj = 0
             
             for x in range(align_size):
-                # size_adj is subtracted from the length of the alignment to remove gapped positions.
                 if ref_seq_aligned[x] == "-" or feat_seq_aligned[x] == "-":
                     size_adj += 1
                     continue
@@ -1576,17 +1571,11 @@ def calculate_percent_ids(sp):
                 if ref_seq_aligned[x] == feat_seq_aligned[x]:
                     matches += 1
                     
-            # The size of the alignment is adjusted for the gapped positions
-            # Check to prevent ZeroDivisionError just in case
             if (align_size - size_adj) > 0:
                 average_percent_similar = (matches / (align_size - size_adj))
             else:
                 average_percent_similar = 0.0
             
-            # Optional: Log the result cleanly
-            # logging.info(f"    Gene {query_id} Alignment: {matches} Matches / {align_size} Length -> AAI: {average_percent_similar:.4f}")
-            
-            # Assign the calculated value to the feature
             feat.percent_identity = average_percent_similar
 
 def make_reference_blastdb():
@@ -1690,6 +1679,16 @@ def make_reference_blastdb():
 
                         locus_tag = q.get("locus_tag", [None])[0]
                         protein_id = q.get("protein_id", [None])[0]
+
+                        if protein_id in [None, 'None', '']:
+                            if locus_tag not in [None, 'None', '']:
+                                protein_id = locus_tag
+                            else:
+                                raise ValueError(
+                                    f"\n[CRITICAL ERROR] No 'protein_id' found for CDS feature (locus_tag: '{locus_tag}') in the local file '{gbk_file}'.\n"
+                                    f"Please ensure all CDS features in your local GenBank reference have valid 'protein_id' qualifiers, then try again."
+                                )
+
                         translation = q.get("translation", [None])[0]
 
                         if translation:
@@ -2378,6 +2377,12 @@ def calc_operon_cons():
             sp.measure_sim(input_records)
             tqdm.write('\t' + str(sp.sim_score))
 
+            # Calculate the average AAI for the species
+            sp.total_avg_aai_calculated = sp.calculate_total_avg_aai()
+
+            detailed_path = os.path.join(output_dir, "output_detailed.csv")
+            append_detailed_out(sp, input_records, detailed_path)
+
             #Drawing operons
             tqdm.write("Drawing " + str(sp.species_name) + " ...")
             sp.draw_figure(color_code=color_code, output_dir=output_dir + 'svg/')
@@ -2408,16 +2413,17 @@ def calc_operon_cons():
         species.remove(sp)
 
     print("Writing output now...")
-    write_all_out()
+    final_output_path = os.path.join(output_dir, "output.csv")
+    write_all_out(species, input_records, final_output_path)
 
     if len(species) == 0:
         print("Skipping iTOL pipeline: no species passed filtering, output.csv contains no data rows.")
     else:
         print("Generating iTOL tree and annotation datasets...")
-    try:
-        run_itol_pipeline()
-    except Exception as e:
-        print(f"iTOL pipeline failed: {e}")
+        try:
+            run_itol_pipeline()
+        except Exception as e:
+            print(f"iTOL pipeline failed: {e}")
 
     #Get time elapsed
     end_time = datetime.datetime.now()

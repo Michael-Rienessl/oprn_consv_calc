@@ -62,13 +62,13 @@ class GenomeFragment:
             seq = getattr(feat, 'aa_sequence', '')
             seq_display = f"{seq[:20]}... (Len: {len(seq)})" if seq else "FEHLT (None)"
             
-            logging.info(
-                f"  Gen {i+1} | "
-                f"Locus: {getattr(feat, 'locus_tag', 'N/A'):<10} | "
-                f"ProtID: {getattr(feat, 'protein_accession', 'N/A'):<12} | "
-                f"Pos: {getattr(feat, 'five_end', 'N/A')} - {getattr(feat, 'three_end', 'N/A')} (Strand {getattr(feat, 'strand', 'N/A')}) | "
-                f"Seq: {seq_display}"
-            )
+            #logging.info(
+            #    f"  Gen {i+1} | "
+            #    f"Locus: {getattr(feat, 'locus_tag', 'N/A'):<10} | "
+            #    f"ProtID: {getattr(feat, 'protein_accession', 'N/A'):<12} | "
+            #    f"Pos: {getattr(feat, 'five_end', 'N/A')} - {getattr(feat, 'three_end', 'N/A')} (Strand {getattr(feat, 'strand', 'N/A')}) | "
+            #    f"Seq: {seq_display}"
+            #)
         logging.info("===================================")
 
     def sort_all_features(self):
@@ -155,6 +155,9 @@ class GenomeFragment:
 
         locus_tag = qualifiers.get('locus_tag', ['None'])[0]
         protein_accession = qualifiers.get('protein_id', ['None'])[0]
+
+        if protein_accession in [None, 'None', ''] and locus_tag not in [None, 'None', '']:
+            protein_accession = locus_tag
 
         # Prefer annotated translation, otherwise try translating from nucleotide.
         aa_sequence = qualifiers.get('translation', [None])[0]

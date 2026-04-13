@@ -25,6 +25,23 @@ class Species:
         self.query_percent_ids = {}
         self.taxid = '-1'
     
+    def calculate_total_avg_aai(self):
+        """
+        Calculates the average AAI of ALL hits found in the genome for this species,
+        not just the average of the maximums.
+        """
+        all_identities = []
+        for frag in self.genome_fragments:
+            for hit in frag.hits:
+                if hasattr(hit, 'percent_identity'):
+                    all_identities.append(float(hit.percent_identity))
+        
+        if all_identities:
+            return sum(all_identities) / len(all_identities)
+        return 0.0
+    
+
+
     ###This function is not used anywhere anymore
     def contains_query_feature(self, query_accession):
         '''
@@ -100,126 +117,93 @@ class Species:
 
     def measure_sim(self, reference_operon):
         '''
-        Determines the score of the operon(s) in this species relative to operon passed in based off the following scoring system:
-            score = (#matching pairs of genes)/(#total possible pairs),
-            (#possible pairs) = (# of total genes) - 1,
-            and any intergenic, non-reference features are ignored.
-        
-        Workflow:
-            1. Make all the pairs from the reference.
-            2. Take a count of how many times each gene occurs in the species.
-            3. Make note of the max number of times each pair can occur in the species based off the count for each gene. 
-            4. Determine how many pairs exit in the species and take the proportion out of the max number of pairs possible. 
-            5. Divide the weighted total number of pairs by the number of pairs in the reference, and return.
-        
-        Examples:
-            abcde
-            abc de [ab bc de] + ab cde [ab cd de]
-            ab/ab → 2/2 = 1
-            bc/bc → 1/2 = 0.5
-            cd/cd → 1/2 = 0.5
-            de/de → 2/2 = 1
-            → 3/4
+        Calculates two types of structural conservation:
+        1. Total Genomic SIM: A global score normalized by gene frequency (Paper Logic).
+        2. Best Operon SIM: Identifies the single best-preserved operon fragment.
 
-            abcde
-            abc de + de
-            ab/ab → 1/1 = 1
-            bc/bc → 1/1 = 1
-            cd/cd → 0/1 = 0
-            de/de → 2/2 = 1
-            → 3/4
+        Detailed Workflow:
+            1. Pair Generation: Creates unique pairs from the reference_operon accessions.
+            2. Global Gene Counting: Counts every occurrence of each query gene across 
+               the entire genome to establish the "Max Possible" denominator.
+            3. Fragment Evaluation: Iterates through all detected operon fragments:
+                - Calculates "Local SIM" and "Local AAI" for each fragment.
+                - Identifies the "Best Operon" (highest Local SIM, then highest Local AAI).
+            4. Pair Tallies: Collects all adjacent gene pairs found in all fragments.
+            5. Total SIM Calculation: For each reference pair, calculates:
+               (Found instances in all fragments) / min(Count of Gene A, Count of Gene B).
+            6. Final Scoring: Averages these weighted values by the number of reference pairs.
 
-        
         Parameters
         ----------
         reference_operon: list[string]
-            This list contains the accessions for the query operon IN THE REFERENCE ORDER
-        
+            Accessions of the query proteins in the exact reference order.
+
         Returns
         -------
-        None - the numerical score relative to the reference operon is stored in the Species object
+        float: The Total Genomic SIM score (also stored in self.sim_score).
         '''
 
-        #Stores tuples representing the different pairs in the reference operon 
+        # 1. Setup Reference Pairs
         ref_pairs = []
-
-        #Populate ref_pairs with pairs of features from the reference operon 
         for i in range(len(reference_operon)-1):
             ref_pairs.append((reference_operon[i], reference_operon[i+1]))
 
         logging.info(f"    [Struct] Perfect Reference Pairs: {ref_pairs}")
 
-        #Holds how many times each reference query got a hit in the species
-        species_query_count = {}
-
-        #Initializes all counts to 0
-        for ref_acc in reference_operon:
-            species_query_count[ref_acc] = 0
-
-        #Stores tuples representing the pairs of reference hits in this species
-        species_pairs = []
-
-        #Iterate through all the genome fragments
+        # 2. Global Gene Counting (for Total Genomic SIM normalization)
+        species_query_count = {acc: 0 for acc in reference_operon}
         for frag in self.genome_fragments:
-
-            #Iterate through all the operons in each genome fragment
-            for operon in frag.operons:
-
-                #Purge operon of any non-reference hits
-                purged_features = []
-
-                for feat in operon.features:
-                    if isinstance(feat, AnnotatedHit):
-
-                        #Append the purged features list
-                        purged_features.append(feat)
-
-                        #Adjust the count in the species_query_count
-                        species_query_count[feat.query_accession] = species_query_count[feat.query_accession] + 1
-                
-                #Determine the pairs from the purged list
-                if len(purged_features) > 0:
-                    for i in range(len(purged_features) - 1):
-
-                        #The tuple that holds the current pair
-                        pair = (purged_features[i].query_accession, purged_features[i+1].query_accession)
-
-                        #Add the pair to the species_pair list
-                        species_pairs.append(pair)
+            for hit in frag.hits:
+                if hit.query_accession in species_query_count:
+                    species_query_count[hit.query_accession] += 1
         
+        # Store for summarized output
+        self.query_hits_counts = species_query_count
 
-        logging.info(f"    [Struct] Found Pairs in {self.species_name}: {species_pairs}")
+        # 3. Analyze Fragments and Find Best Operon
+        species_pairs = []
+        self.best_operon = None
+        max_local_sim = -1.0
+        max_local_aai = -1.0
 
-        #Holds the weighted number of matched pairs
+        for frag in self.genome_fragments:
+            for operon in frag.operons:
+                # Use the new method from operon.py (Step 1)
+                operon.calculate_local_stats(ref_pairs)
+                
+                # Logic to identify the Best Operon in the species
+                if (operon.local_sim > max_local_sim) or \
+                   (operon.local_sim == max_local_sim and operon.local_aai > max_local_aai):
+                    max_local_sim = operon.local_sim
+                    max_local_aai = operon.local_aai
+                    self.best_operon = operon
+
+                # Collect observed pairs for the Total SIM math
+                # We only count pairs consisting of reference genes
+                purged = [f for f in operon.features if hasattr(f, 'query_accession')]
+                if len(purged) > 1:
+                    for i in range(len(purged) - 1):
+                        species_pairs.append((purged[i].query_accession, purged[i+1].query_accession))
+
+        # 4. Total Genomic SIM Calculation (Paper-based)
         weighted_num_match = 0
-
-        #Calculate the weighted number of matched pairs for each pair in the reference operon
         for ref_pair in ref_pairs:
-
-            #Determine the max number of times this pair could occur in the species
+            # Count how many times this pair appears (both directions if needed)
+            num_occur = species_pairs.count(ref_pair) + species_pairs.count((ref_pair[1], ref_pair[0]))
+            
+            # Max possible is the "bottleneck" (minimum count of the two genes)
             max_possible_occur = min(species_query_count[ref_pair[0]], species_query_count[ref_pair[1]])
 
-            #Holds the number occurences in the species
-            num_occur = 0
-
-            #Iterate through all the pairs found in the species and compare them to the pair from the reference operon
-            for sp_pair in species_pairs:
-                if ref_pair[0] in sp_pair and ref_pair[1] in sp_pair:
-                    num_occur = num_occur + 1
-            
-            #Adjust the weighted total
             if max_possible_occur > 0:
-                added_weight = (num_occur/max_possible_occur)
-                weighted_num_match = weighted_num_match + added_weight
-                logging.info(f"    [Struct] Pair {ref_pair} Math: Found {num_occur} / Max {max_possible_occur} -> Added Weight: {added_weight:.2f}")
+                added_weight = (num_occur / max_possible_occur)
+                weighted_num_match += added_weight
+                logging.info(f"    [Struct] Pair {ref_pair} Math: Found {num_occur} / Max {max_possible_occur} -> Weight: {added_weight:.2f}")
             else:
-                logging.info(f"    [Struct] Pair {ref_pair} Math: Max possible is 0 -> Added Weight: 0.00")
+                logging.info(f"    [Struct] Pair {ref_pair} Math: Max possible is 0 -> Weight: 0.00")
 
-
-        final_score = weighted_num_match/len(ref_pairs)
-            
-        self.sim_score = final_score
-
+        # 5. Finalize
+        self.sim_score = weighted_num_match / len(ref_pairs) if ref_pairs else 0.0
+        return self.sim_score
 
     def extract_taxids(self):
         '''
