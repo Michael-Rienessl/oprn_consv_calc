@@ -11,15 +11,22 @@ import os
 import math
 import logging
 
+import operon
+
 class Species:
     '''
     Holds all the GenomeFragment objects that belong to the same species. 
     '''
 
-    def __init__(self, assembly_accession, genome_fragments=[]):
+    def __init__(self, assembly_accession, genome_fragments=None):
         self.assembly_accession = assembly_accession
         self.species_name = 'No Name Assigned'
-        self.genome_fragments = genome_fragments
+        
+        if genome_fragments is None:
+            self.genome_fragments = []
+        else:
+            self.genome_fragments = genome_fragments
+            
         self.genome_fragments_accessions = []
         self.sim_score = 0
         self.query_percent_ids = {}
@@ -133,6 +140,23 @@ class Species:
                (Found instances in all fragments) / min(Count of Gene A, Count of Gene B).
             6. Final Scoring: Averages these weighted values by the number of reference pairs.
 
+        Examples:
+            abcde
+            abc de [ab bc de] + ab cde [ab cd de]
+            ab/ab → 2/2 = 1
+            bc/bc → 1/2 = 0.5
+            cd/cd → 1/2 = 0.5
+            de/de → 2/2 = 1
+            → 3/4
+
+            abcde
+            abc de + de
+            ab/ab → 1/1 = 1
+            bc/bc → 1/1 = 1
+            cd/cd → 0/1 = 0
+            de/de → 2/2 = 1
+            → 3/4
+
         Parameters
         ----------
         reference_operon: list[string]
@@ -179,12 +203,14 @@ class Species:
                     self.best_operon = operon
 
                 # Collect observed pairs for the Total SIM math
-                # We only count pairs consisting of reference genes
-                purged = [f for f in operon.features if hasattr(f, 'query_accession')]
+                # We only count features that are actual BLAST hits (AnnotatedHit)
+                purged = [f for f in operon.features if isinstance(f, AnnotatedHit)]
                 if len(purged) > 1:
                     for i in range(len(purged) - 1):
                         species_pairs.append((purged[i].query_accession, purged[i+1].query_accession))
 
+        logging.info(f"    [Struct] Found Pairs in {self.species_name}: {species_pairs}")
+        
         # 4. Total Genomic SIM Calculation (Paper-based)
         weighted_num_match = 0
         for ref_pair in ref_pairs:

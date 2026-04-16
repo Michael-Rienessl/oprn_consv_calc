@@ -125,10 +125,6 @@ reverse_blast_root = './reverse_blast/{ref_assembly_accession}'
 reference_total_protein = './reverse_blast/{ref_assembly_accession}/{ref_assembly_accession}.fasta'
 reference_blast_db = './reverse_blast/{ref_assembly_accession}/{ref_assembly_accession}_blastdb'
 
-
-#The list of GenomeFragment objects that the BLAST hits get sorted into
-genome_frags = []
-
 #The list of species
 species = []
 
@@ -680,60 +676,6 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
     print("\t|~> Returning " + str(len(return_hits)) + " unique hits")
     return return_hits
 
-def genome_fragment_exists(fragment_name, genome_accession):
-    '''
-    Checks if an GenomeFragment object with name fragment_name and gene_accession has already been constructed.
-
-    Parameters
-    ----------
-    fragment_name: string
-        The name of the GenomeFragment of interest.
-    gene_accession: string
-        The accession code the genome record of the GenomeFragment
-    
-    Returns
-    -------
-    does_exist: (bool, GenomeFragment)
-        Tuple where the first element is True if exists, false otherwise. The second element is the matching GenomeFragment object, or None if it doesnt exist. 
-
-    '''
-
-    does_exist = (False, None)
-
-    global genome_frags
-
-    for fragment in genome_frags:
-        if fragment.name == fragment_name and fragment.genome_accession == genome_accession:
-            does_exist = (True, fragment)
-    
-
-    return does_exist
-
-def species_exits(assembly_accession):
-    '''
-    Checks if species requested exists in the species list
-
-    Parameters
-    ----------
-    species_name: string
-        The name of the requested species
-    
-    Returns
-    -------
-    does_exit: (bool, Species)
-        Tuple where the first element is True if exists, false otherwise. The second element is the matching Species object, or None if it doesnt exist. 
-    '''
-
-    does_exist = (False, None)
-
-    global species
-
-    for sp in species:
-        if sp.assembly_accession == assembly_accession:
-            does_exist = (True, sp)   
-
-    return does_exist
-
 def load_input_file(filename):
     '''
     Loads all the paramters from the input JSON.
@@ -977,26 +919,36 @@ def write_all_out(species_list, query_accessions, output_path):
     with open(summary_file, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         
-        # Build Header
-        header = ['Species', 'TaxID', 'Best_Operon_SIM', 'Total_Genomic_SIM', 'Best_Operon_Avg_AAI', 'Global_Total_Avg_AAI']
+        header = [
+            'Species', 
+            'TaxID', 
+            'Assembly_Accession', 
+            'Best_Operon_Nucleotide_ID', 
+            'Best_Operon_SIM', 
+            'Total_Genomic_SIM', 
+            'Best_Operon_Avg_AAI', 
+            'Global_Total_Avg_AAI'
+        ]
         
-        # AAI of each gene IN the best operon
         for q_acc in query_accessions:
             header.append(f'Best_Op_{q_acc}_AAI')
             
-        # Total counts in the whole genome
         for q_acc in query_accessions:
             header.append(f'Total_Count_{q_acc}')
             
-        header.extend(['Assembly_Accession', 'Nucleotide_ID'])
         writer.writerow(header)
 
         for sp in species_list:
             row = []
             row.append(sp.species_name)
             row.append(getattr(sp, 'taxid', 'N/A'))
+            row.append(getattr(sp, 'assembly_accession', 'N/A'))
             
-            # Best Operon Stats
+            if sp.best_operon:
+                row.append(sp.best_operon.genome_accession)
+            else:
+                row.append('N/A')
+
             if sp.best_operon:
                 row.append(f"{sp.best_operon.local_sim * 100:.1f}%")
                 row.append(f"{sp.sim_score * 100:.1f}%")
@@ -1004,33 +956,21 @@ def write_all_out(species_list, query_accessions, output_path):
             else:
                 row.extend(["0.0%", f"{sp.sim_score * 100:.1f}%", "0.0%"])
 
-            # Global Total Average AAI
             global_aai = getattr(sp, 'total_avg_aai_calculated', 0.0)
             row.append(f"{global_aai * 100:.2f}%")
 
-            # --- NEW LOGIC: AAI for all Queries from best Operon ---
             for q_acc in query_accessions:
                 aai_val = "N/A"
                 if sp.best_operon:
-                    # Search specifically in the best operon's features
                     for feat in sp.best_operon.features:
-                        if hasattr(feat, 'query_accession') and feat.query_accession == q_acc:
+                        if isinstance(feat, AnnotatedHit) and feat.query_accession == q_acc:
                             aai_val = f"{feat.percent_identity * 100:.1f}%"
                             break
                 row.append(aai_val)
 
-            # Total Counts per Query (Genomic wide)
             for q_acc in query_accessions:
                 count = sp.query_hits_counts.get(q_acc, 0)
                 row.append(count)
-
-            # Metadata from best operon
-            if sp.best_operon:
-                row.append(getattr(sp, 'assembly_accession', 'N/A'))
-                row.append(sp.best_operon.genome_accession)
-            else:
-                row.append(getattr(sp, 'assembly_accession', 'N/A'))
-                row.append('N/A')
 
             writer.writerow(row)
         
@@ -1039,31 +979,53 @@ def append_detailed_out(sp, query_accessions, detailed_path):
     Appends the operon fragments of a single species to the detailed CSV.
     '''
     import csv
+    import os
+    from features import AnnotatedHit # Sicherstellen, dass der Import vorhanden ist
+
     file_exists = os.path.isfile(detailed_path)
     
     with open(detailed_path, 'a', newline='') as csvfile:
         writer = csv.writer(csvfile)
         
         if not file_exists:
-            header = ['Species', 'Fragment_SIM', 'Fragment_Avg_AAI']
+            header = ['Species', 'Nucleotide Accession', 'Fragment_SIM', 'Fragment_Avg_AAI']
             for q_acc in query_accessions:
-                header.extend([f'{q_acc}_AAI', f'{q_acc}_Accession', f'{q_acc}_Start', f'{q_acc}_Stop', f'{q_acc}_Strand'])
+                header.extend([
+                    f'{q_acc}_AAI', 
+                    f'{q_acc}_Accession', 
+                    f'{q_acc}_Start', 
+                    f'{q_acc}_Stop', 
+                    f'{q_acc}_Strand'
+                ])
             writer.writerow(header)
 
         for frag in sp.genome_fragments:
             for operon in frag.operons:
-                row = [sp.species_name, f"{operon.local_sim * 100:.1f}%", f"{operon.local_aai * 100:.1f}%"]
+                row = [
+                    sp.species_name, 
+                    operon.genome_accession, 
+                    f"{operon.local_sim * 100:.1f}%", 
+                    f"{operon.local_aai * 100:.1f}%"
+                ]
+                
                 for q_acc in query_accessions:
                     found_hit = None
                     for feat in operon.features:
-                        if hasattr(feat, 'query_accession') and feat.query_accession == q_acc:
+                        if isinstance(feat, AnnotatedHit) and feat.query_accession == q_acc:
                             found_hit = feat
                             break
+                    
                     if found_hit:
-                        row.extend([f"{found_hit.percent_identity* 100:.1f}%", found_hit.protein_accession, 
-                                   found_hit.five_end, found_hit.three_end, found_hit.strand])
+                        row.extend([
+                            f"{found_hit.percent_identity * 100:.1f}%", 
+                            found_hit.protein_accession, 
+                            found_hit.five_end, 
+                            found_hit.three_end, 
+                            found_hit.strand
+                        ])
                     else:
                         row.extend(['N/A', 'N/A', 'N/A', 'N/A', 'N/A'])
+                
                 writer.writerow(row)
 
 def run_itol_pipeline():
@@ -1122,108 +1084,96 @@ def run_itol_pipeline():
             print("iTOL pipeline finished successfully.")
             print(proc.stdout)
 
-def pre_process_fragments():
+def fetch_nuccore_metadata(curr_acc):
     '''
-    Will fetch the assembly accessions, species name, and taxids for all the fragments.
-    Robust version: Downloads records ONE BY ONE to prevent NCBI Server timeouts.
+    Fetches the assembly accession, species name, and taxid for a single nuccore accession.
+    Returns a lightweight dictionary to avoid holding heavy objects in memory.
     '''
-    if len(genome_frags) == 0:
-        logging.info("No genome fragments to preprocess")
-        return
+    metadata = {
+        'assembly_accession': curr_acc, # Fallback
+        'taxid': '-1',
+        'species_name': None
+    }
+    
+    logging.info(f"Downloading metadata records for {curr_acc}...")
 
-    logging.info(f'Total number of fragments to process: {len(genome_frags)}')
+    records = None
+    for i in range(REQUEST_LIMIT):
+        try:
+            handle = Entrez.efetch(db="nuccore", id=curr_acc, rettype='gb', retmode='XML')
+            records = list(Entrez.read(handle, 'xml'))
+            time.sleep(SLEEP_TIME)
+            break
+        except Exception as e:
+            logging.warning(f"NCBI efetch exception on attempt {i+1}/{REQUEST_LIMIT} for {curr_acc}: {e}")
+            time.sleep(SLEEP_TIME * 2)
 
-    for index, fragment in enumerate(genome_frags):
-        curr_acc = fragment.genome_accession
-        logging.info(f"[{index+1}/{len(genome_frags)}] Downloading records for {curr_acc}...")
+    if not records:
+        logging.error(f"Could not fetch data for {curr_acc}. Skipping metadata extraction.")
+        return metadata
 
-        records = None
-        for i in range(REQUEST_LIMIT):
+    record = records[0]
+    assembly_found = False
+
+    # 1) Assembly via GBSeq_xrefs
+    for info in record.get('GBSeq_xrefs', []):
+        if info.get('GBXref_dbname') == 'Assembly':
+            metadata['assembly_accession'] = info.get('GBXref_id')
+            assembly_found = True
+            break
+
+    # 2) Fallback: nuccore -> assembly via elink
+    if not assembly_found:
+        link_records = None
+        for attempt in range(REQUEST_LIMIT):
             try:
-                # We only fetch this ONE genome record (not all at once) to avoid NCBI timeouts
-                handle = Entrez.efetch(
-                    db="nuccore",
-                    id=curr_acc,
-                    rettype='gb',
-                    retmode='XML'
-                )
-                records = list(Entrez.read(handle, 'xml'))
+                link_handle = Entrez.elink(dbfrom="nuccore", db="assembly", id=curr_acc)
+                link_records = Entrez.read(link_handle)
                 time.sleep(SLEEP_TIME)
                 break
-            except Exception as e:
-                logging.warning(f"NCBI efetch exception on attempt {i+1}/{REQUEST_LIMIT} for {curr_acc}: {e}")
-                time.sleep(SLEEP_TIME * 2)
-
-        if not records:
-            logging.error(f"Could not fetch data for {curr_acc}. Skipping metadata extraction.")
-            # We keep the fragment anyway to avoid crashing the pipeline, but we won't have assembly/taxid/species info for it
-            fragment.assembly_accession = curr_acc
-            continue
-
-        record = records[0]
-        assembly_found = False
-
-        # 1) Assembly via GBSeq_xrefs
-        for info in record.get('GBSeq_xrefs', []):
-            if info.get('GBXref_dbname') == 'Assembly':
-                fragment.assembly_accession = info.get('GBXref_id')
-                assembly_found = True
-                break
-
-        # 2) Fallback: nuccore -> assembly via elink
-        if not assembly_found:
-            link_records = None
-            for attempt in range(REQUEST_LIMIT):
-                try:
-                    link_handle = Entrez.elink(dbfrom="nuccore", db="assembly", id=curr_acc)
-                    link_records = Entrez.read(link_handle)
-                    time.sleep(SLEEP_TIME)
-                    break
-                except Exception:
-                    time.sleep(SLEEP_TIME)
-            
-            if link_records:
-                asm_id = None
-                for lr in link_records:
-                    for lset in lr.get("LinkSetDb", []):
-                        for link in lset.get("Link", []):
-                            asm_id = link.get("Id")
-                            if asm_id: break
+            except Exception:
+                time.sleep(SLEEP_TIME)
+        
+        if link_records:
+            asm_id = None
+            for lr in link_records:
+                for lset in lr.get("LinkSetDb", []):
+                    for link in lset.get("Link", []):
+                        asm_id = link.get("Id")
                         if asm_id: break
                     if asm_id: break
+                if asm_id: break
 
-                if asm_id:
-                    for attempt in range(REQUEST_LIMIT):
+            if asm_id:
+                for attempt in range(REQUEST_LIMIT):
+                    try:
+                        sum_handle = Entrez.esummary(db="assembly", id=asm_id, retmode="xml")
+                        sum_records = Entrez.read(sum_handle)
+                        time.sleep(SLEEP_TIME)
                         try:
-                            sum_handle = Entrez.esummary(db="assembly", id=asm_id, retmode="xml")
-                            sum_records = Entrez.read(sum_handle)
-                            time.sleep(SLEEP_TIME)
-                            try:
-                                docsum = sum_records['DocumentSummarySet']['DocumentSummary'][0]
-                                asm_acc = docsum.get('AssemblyAccession', None)
-                                if asm_acc:
-                                    fragment.assembly_accession = asm_acc
-                                    assembly_found = True
-                            except Exception:
-                                pass
-                            break
+                            docsum = sum_records['DocumentSummarySet']['DocumentSummary'][0]
+                            asm_acc = docsum.get('AssemblyAccession', None)
+                            if asm_acc:
+                                metadata['assembly_accession'] = asm_acc
+                                assembly_found = True
                         except Exception:
-                            time.sleep(SLEEP_TIME)
+                            pass
+                        break
+                    except Exception:
+                        time.sleep(SLEEP_TIME)
 
-        if not assembly_found:
-            logging.info(f"Assembly not found for: {curr_acc}. Using nuccore ID as fallback.")
-            fragment.assembly_accession = curr_acc
+    # 3) TaxID + organism name from source feature
+    for feature in record.get('GBSeq_feature-table', []):
+        if feature.get('GBFeature_key') == 'source':
+            for qual in feature.get('GBFeature_quals', []):
+                if qual.get('GBQualifier_name') == 'db_xref':
+                    val = qual.get('GBQualifier_value', '')
+                    if val.startswith('taxon:'):
+                        metadata['taxid'] = val.split(':', 1)[1]
+                if qual.get('GBQualifier_name') == 'organism':
+                    metadata['species_name'] = qual.get('GBQualifier_value')
 
-        # 3) TaxID + organism name from source feature
-        for feature in record.get('GBSeq_feature-table', []):
-            if feature.get('GBFeature_key') == 'source':
-                for qual in feature.get('GBFeature_quals', []):
-                    if qual.get('GBQualifier_name') == 'db_xref':
-                        val = qual.get('GBQualifier_value', '')
-                        if val.startswith('taxon:'):
-                            fragment.taxid = val.split(':', 1)[1]
-                    if qual.get('GBQualifier_name') == 'organism':
-                        fragment.species_name = qual.get('GBQualifier_value')
+    return metadata
 
 def process_frag(fragment, lock):
     '''
@@ -2152,7 +2102,6 @@ def calc_operon_cons():
         9. Output all the operons into a CSV file.
     '''
 
-    global genome_frags
     global species
     global output_dir
     global run_id
@@ -2251,166 +2200,101 @@ def calc_operon_cons():
         print('Running total of hits returned: ' + str(len(final_hits)))
         time.sleep(3)
 
-    
-    ##Group all the hits into GenomeFragments
-    for hit in tqdm(final_hits, desc='Grouping Hits to Fragments'):
-
-        #Check if hits are annotated
+    ## 1. Map Hits to Nucleotide Accessions (Lightweight Dictionary)
+    nuccore_to_hits = {}
+    for hit in tqdm(final_hits, desc='Mapping Hits to Nucleotides'):
         if not isinstance(hit, AnnotatedHit):
-            print("The annotate option needs to be set to true for the GenomeFragment grouping to work.")
+            print("The annotate option needs to be set to true for grouping to work.")
             return
-        
-        #Check if there is a genome fragment for the hit
-        genome_fragment_check = genome_fragment_exists(fragment_name=hit.genome_fragment_name, genome_accession=hit.genome_accession)
+        if hit.genome_accession not in nuccore_to_hits:
+            nuccore_to_hits[hit.genome_accession] = []
+        nuccore_to_hits[hit.genome_accession].append(hit)
 
-        #Adds the hit to appropriate GenomeFragment or makes a new GenomeFragment object if one does not exist
-        if genome_fragment_check[0]:
-            genome_fragment_check[1].add_hit(hit)
-        else:
-            new_genome_fragment = GenomeFragment(name=hit.genome_fragment_name, genome_fragment_accession=hit.genome_accession, req_limit=REQUEST_LIMIT, sleep_time=SLEEP_TIME, cache_directory=cache_dir)
-            new_genome_fragment.add_hit(hit)
-            genome_frags.append(new_genome_fragment)
+    ## 2. Pre-process metadata for each unique nucleotide (Lightweight)
+    nuccore_metadata = {}
+    for acc in tqdm(nuccore_to_hits.keys(), desc='Fetching Metadata'):
+        nuccore_metadata[acc] = fetch_nuccore_metadata(acc)
 
+    ## 3. Group nucleotide accessions by Assembly (Species)
+    assembly_to_nuccore = {}
+    for acc, meta in nuccore_metadata.items():
+        asm = meta['assembly_accession']
+        if asm not in assembly_to_nuccore:
+            assembly_to_nuccore[asm] = []
+        assembly_to_nuccore[asm].append(acc)
 
-    #Get all the assembly accessions for the hits
-    tqdm.write('Pre-processing fragments...')
-    pre_process_fragments()
+    ## 4. Iterative Lazy-Loading Processing
+    # Load, process, and purge species one by one to save RAM
+    global species
+    species = [] # List for the final, lightweight summary data
 
+    for asm, acc_list in tqdm(assembly_to_nuccore.items(), desc='Processing Species (Lazy Load)'):
+        sp = Species(assembly_accession=asm)
+        processing_threads = []
 
-    #Grouping all GenomeFragments to species
-    for fragment in tqdm(genome_frags, desc='Grouping Fragments to Species'):
+        # A) Load only the fragments for THIS species into RAM
+        for acc in acc_list:
+            meta = nuccore_metadata[acc]
+            frag_name = nuccore_to_hits[acc][0].genome_fragment_name
 
-        #Add the fragment to the appropriate Species object or make a new Species object
-        species_check = species_exits(fragment.assembly_accession)
+            frag = GenomeFragment(
+                name=frag_name, 
+                genome_fragment_accession=acc, 
+                req_limit=REQUEST_LIMIT, 
+                sleep_time=SLEEP_TIME, 
+                cache_directory=cache_dir
+            )
+            frag.taxid = meta['taxid']
+            frag.species_name = meta['species_name']
+            frag.assembly_accession = asm
 
-        if species_check[0]:
-            species_check[1].add_genome_fragment(fragment)
-        else:
-            new_species = Species(assembly_accession=fragment.assembly_accession, genome_fragments=[fragment])
-            species.append(new_species)
-   
-    '''
-    ##Filter the species based off the species_percent_id_limit
-    to_remove = []
-    for sp in tqdm(species, desc='Filtering Species'):
+            # Add hits to fragment
+            for hit in nuccore_to_hits[acc]:
+                frag.add_hit(hit)
 
-        #Calculate the percent id for each of the querery genes
-        tqdm.write("\tCalculating percent IDs for " + str(sp.assembly_accession) + " ...")
-        sp.get_query_percent_ids(input_records)
+            sp.add_genome_fragment(frag)
 
-        #Determine if any of the quereies are above the limit
-        above_limit = False 
-
-        for val in sp.query_percent_ids.values():
-            if val >= species_percent_id_limit:
-                above_limit = True
-        
-        #Remove species object if it is not above the limit
-        if not above_limit:
-            to_remove.append(sp)
-    
-    for sp in to_remove:
-        species.remove(sp)'''
-
-
-    ##Detect the features for the hits in each GenomeFragment, assemble the operons, and sort into a Species
-
-    #How many threads to run at once
-    thread_limit = 10
-
-    #Holds threads for each iteration
-    processing_threads = []
-
-    #Proccess one species at a time
-    to_remove = []
-    for sp in tqdm(species, desc='Species Processing'):
-
-        #Iterate through each fragment in the species and process it
-        for fragment in sp.genome_fragments:
+            # Analyze fragment (loads the .gb file, assembles operons)
             lock = threading.Lock()
-            temp_thread = threading.Thread(target=process_frag, args=(fragment, lock))
+            temp_thread = threading.Thread(target=process_frag, args=(frag, lock))
             temp_thread.start()
             processing_threads.append(temp_thread)
 
-            if len(processing_threads) == thread_limit:
-                #Waits for all threads to finish before continuing 
-                for t in processing_threads:
-                    t.join()
-                del processing_threads
-                processing_threads = []
-            
-        #Waits for all threads to finish before continuing 
+        # Wait until all fragments for THIS species are processed
         for t in processing_threads:
             t.join()
 
-        #Calculate the percent id for each of the hits in every fragment in every species 
-        tqdm.write('Caclulating percent ids for ' + str(sp.assembly_accession) + '...')
+        # B) Calculate scores for this species
+        tqdm.write(f'Calculating IDs and Scores for {asm}...')
         calculate_percent_ids(sp)
         sp.get_query_percent_ids(input_records)
 
-        #Determine if any of the quereies are above the limit
-        above_limit = False 
+        above_limit = any(val >= species_percent_id_limit for val in sp.query_percent_ids.values())
 
-        for val in sp.query_percent_ids.values():
-            if val >= species_percent_id_limit:
-                above_limit = True
-        
         if above_limit:
-
-            #Extract the species name
-            tqdm.write("Extracting species name for " + str(sp.assembly_accession) + " ...")
             sp.extract_names()
-            tqdm.write('\t' + str(sp.species_name))
-            
-            #Extract the taxIds
-            tqdm.write("Extracting txid for " + str(sp.species_name) + " ...")
             sp.extract_taxids()
-            tqdm.write('\t' + str(sp.taxid))
-
-            #Extract the genome accessions
-            tqdm.write("Extracting genome accessions for " + str(sp.species_name) + " ...")
             sp.extract_genome_accessions()
-            tqdm.write('\t' + str(sp.genome_fragments_accessions))
-
-            #Calculate the score for the species
-            tqdm.write("Calculating structural similarity score for " + str(sp.species_name) + " ...")
             sp.measure_sim(input_records)
-            tqdm.write('\t' + str(sp.sim_score))
-
-            # Calculate the average AAI for the species
             sp.total_avg_aai_calculated = sp.calculate_total_avg_aai()
 
+            # C) Write directly to disk (Lazy Writing)
             detailed_path = os.path.join(output_dir, "output_detailed.csv")
             append_detailed_out(sp, input_records, detailed_path)
-
-            #Drawing operons
-            tqdm.write("Drawing " + str(sp.species_name) + " ...")
+            
             sp.draw_figure(color_code=color_code, output_dir=output_dir + 'svg/')
 
-            #Clear up the species object so it is not using up memory
-            tqdm.write("Cleaning up " + str(sp.species_name) + " ...")
-            sp.clean()
+            # D) CLEAN UP RAM
+            # sp.clean() deletes the 'sp.genome_fragments' list.
+            # Since the global 'genome_frags' list is gone, these 
+            # massive objects are now truly destroyed by the Python Garbage Collector.
+            sp.clean() 
+            
+            # The lightweight shell (scores, names) goes into the summary list
+            species.append(sp) 
         else:
-            #Clear up the species object so it is not using up memory
-            tqdm.write("Did not meet percent ID threshold. Cleaning up " + str(sp.assembly_accession) + " ...")
+            tqdm.write(f"Did not meet threshold. Purging {asm} from RAM...")
             sp.clean()
-
-            to_remove.append(sp)
-
-
-
-    ##Output the results
-    '''
-    output_filename_base = ''
-    if sys.argv[2]:
-        output_filename_base = sys.argv[2]
-    else:
-        output_filename_base = 'output_' +str(datetime.datetime.now().strftime("%d-%m-%Y_%H-%M-%S"))'''
-
-    
-    #Remove all species that did not meet the percent ID requirement
-    for sp in to_remove:
-        species.remove(sp)
 
     print("Writing output now...")
     final_output_path = os.path.join(output_dir, "output.csv")
