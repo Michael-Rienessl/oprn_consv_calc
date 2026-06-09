@@ -7,3 +7,17 @@ lokale_db/
 pipeline_test_log.txt
 *.xml
 *.fasta
+
+# --- NEWLY ADDED ---
+# NCBI Entrez DTD files (automatically downloaded by Biopython)
+*.dtd
+
+# Jupyter Notebook temporary checkpoints
+.ipynb_checkpoints/
+
+# iTOL pipeline outputs (if they shouldn't be versioned)
+itol_pipeline/itol_out/
+
+# OS generated files (Windows/Mac)
+.DS_Store
+Thumbs.db

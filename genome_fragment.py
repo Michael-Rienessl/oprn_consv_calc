@@ -16,8 +16,22 @@ class GenomeFragment:
     
     '''
     
-    def __init__(self, name, genome_fragment_accession, req_limit, sleep_time, cache_directory):
+    def __init__(
+        self,
+        name,
+        genome_fragment_accession,
+        req_limit,
+        sleep_time,
+        cache_directory,
+        allow_ncbi_download=True
+    ):
+        
         self.cache_directory = cache_directory
+        self.allow_ncbi_download = allow_ncbi_download
+
+        # Optional direct local GenBank file path.
+        # Set by operon_conserve_detect.py in local BLAST mode.
+        self.local_gbk_file_path = None
 
         self.hits = []
         self.all_features = []
@@ -31,7 +45,6 @@ class GenomeFragment:
         self.sleep_time = sleep_time
 
         self.full_record = None
-
         self.species_name = None
 
     def fetch_features(self):
@@ -43,7 +56,9 @@ class GenomeFragment:
         if self.full_record is None:
             self.fetch_record()
         
-        self.all_features = []
+        if self.full_record is None:
+            self.all_features = []
+            return
 
         for feat in self.full_record.features:
             gf = self._seqfeature_to_genomefeature(feat, self.full_record)
@@ -57,19 +72,6 @@ class GenomeFragment:
         logging.info(f"Fragment Accession: {getattr(self, 'genome_accession', 'N/A')}")
         logging.info(f"Total features parsed: {len(self.all_features)}")
 
-        # Zeige nur die ersten 3 Gene des gesamten Genoms kompakt an
-        for i, feat in enumerate(self.all_features):
-            seq = getattr(feat, 'aa_sequence', '')
-            seq_display = f"{seq[:20]}... (Len: {len(seq)})" if seq else "FEHLT (None)"
-            
-            #logging.info(
-            #    f"  Gen {i+1} | "
-            #    f"Locus: {getattr(feat, 'locus_tag', 'N/A'):<10} | "
-            #    f"ProtID: {getattr(feat, 'protein_accession', 'N/A'):<12} | "
-            #    f"Pos: {getattr(feat, 'five_end', 'N/A')} - {getattr(feat, 'three_end', 'N/A')} (Strand {getattr(feat, 'strand', 'N/A')}) | "
-            #    f"Seq: {seq_display}"
-            #)
-        logging.info("===================================")
 
     def sort_all_features(self):
         '''
@@ -79,50 +81,190 @@ class GenomeFragment:
         self.all_features.sort(key=lambda x: x.five_end)
 
     def fetch_record(self):
-        '''
-        Obtain the full genome record as a Biopython SeqRecord.
-        Read from cache if available, otherwise download GenBank text from NCBI.
-        '''
+        """
+        Obtains the full GenBank record for the fragment.
 
-        record_file = os.path.join(self.cache_directory, self.genome_accession + '.gb')
+        Local mode:
+            - uses self.local_gbk_file_path if provided,
+            - never downloads from NCBI if allow_ncbi_download=False,
+            - does not modify the accession,
+            - expects self.genome_accession == GenBank record.id.
 
-        cache_dir = os.path.dirname(record_file)
-        if cache_dir and not os.path.exists(cache_dir):
-            os.makedirs(cache_dir, exist_ok=True)
-        
-        if not os.path.exists(record_file):
-            record = None
+        Remote mode:
+            - uses the fast cache convention first:
+                  <cache_directory>/<genome_accession>.gb
+            - if this exact cache file exists, it is opened directly.
+            - if it does not exist, the record is downloaded from NCBI and
+              written to that exact file name.
+        """
+        import os
+        import logging
+        from Bio import Entrez, SeqIO
 
-            for i in range(self.req_limit):
+        target_acc = str(self.genome_accession).strip()
 
-                try:
-                    handle = Entrez.efetch(
-                        db="nuccore",
-                        id=self.genome_accession,
-                        strand=1,
-                        seq_start='begin',
-                        seq_stop='end',
-                        rettype='gbwithparts',
-                        retmode='text'
-                    )
+        # ------------------------------------------------------------
+        # 1. Fast local path from pre-built index
+        # ------------------------------------------------------------
+        local_path = getattr(self, "local_gbk_file_path", None)
 
-                    record = handle.read()
-                    time.sleep(self.sleep_time)
-                    break
+        if local_path and os.path.exists(local_path):
+            try:
+                for record in SeqIO.parse(local_path, "genbank"):
+                    record_id = str(record.id).strip()
 
-                except:
-                    print("\t\tNCBI exception raised on attempt " + str(i) +
-                        "\n\t\treattempting now for " + str(self) + "...")
+                    if record_id == target_acc:
+                        self.full_record = record
+                        self.species_name = record.annotations.get("organism", "Unknown Species")
 
-                    if i == (self.req_limit - 1):
-                        print("\t\tCould not download record after " + str(self.req_limit) + " attempts")
+                        logging.info(
+                            f"Loaded indexed local record for {self.genome_accession} "
+                            f"from {os.path.basename(local_path)}"
+                        )
+                        return
 
-            if record:
-                with open(record_file, 'w', encoding='utf-8') as file:
-                    file.write(record)
-        
-        with open(record_file, 'r', encoding='utf-8') as file:
-            self.full_record = SeqIO.read(file, 'genbank')
+                logging.error(
+                    f"Indexed local file exists, but no exact record.id match was found. "
+                    f"target={target_acc}, file={local_path}"
+                )
+
+                self.full_record = None
+                self.species_name = "Unknown Species"
+                return
+
+            except Exception as e:
+                logging.error(f"Failed to read indexed local GenBank file {local_path}: {e}")
+                self.full_record = None
+                self.species_name = "Unknown Species"
+                return
+
+        # ------------------------------------------------------------
+        # 2. Local mode safety lock
+        # ------------------------------------------------------------
+        if not self.allow_ncbi_download:
+            logging.error(
+                f"[LOCAL MODE BLOCKED] No indexed local GBK file for {self.genome_accession}. "
+                f"NCBI download is disabled."
+            )
+            self.full_record = None
+            self.species_name = "Unknown Species"
+            return
+
+        # ------------------------------------------------------------
+        # 3. Remote mode: direct cache lookup by accession-based filename
+        # ------------------------------------------------------------
+        os.makedirs(self.cache_directory, exist_ok=True)
+
+        # Remote cache convention:
+        #     Genome accession CP000000.1 -> cache/CP000000.1.gb
+        record_file = os.path.join(self.cache_directory, f"{target_acc}.gb")
+
+        if os.path.exists(record_file):
+            try:
+                with open(record_file, "r", encoding="utf-8") as handle:
+                    self.full_record = SeqIO.read(handle, "genbank")
+
+                self.species_name = self.full_record.annotations.get("organism", "Unknown Species")
+                logging.info(
+                    f"Loaded remote cached record for {self.genome_accession} "
+                    f"from {os.path.basename(record_file)}"
+                )
+                return
+
+            except Exception as e:
+                logging.warning(
+                    f"Cached GenBank file exists but could not be parsed: "
+                    f"{record_file}. Will attempt to re-download. Error: {e}"
+                )
+                self.full_record = None
+
+        # Compatibility direct checks for cache files written by older/newer
+        # pipeline versions. These are still O(1)-style checks because they
+        # test exact expected filenames, not the whole cache directory.
+        for ext in (".gbk", ".gbff", ".genbank"):
+            alt_file = os.path.join(self.cache_directory, f"{target_acc}{ext}")
+
+            if not os.path.exists(alt_file):
+                continue
+
+            try:
+                with open(alt_file, "r", encoding="utf-8") as handle:
+                    self.full_record = SeqIO.read(handle, "genbank")
+
+                self.species_name = self.full_record.annotations.get("organism", "Unknown Species")
+                logging.info(
+                    f"Loaded remote cached record for {self.genome_accession} "
+                    f"from {os.path.basename(alt_file)}"
+                )
+                return
+
+            except Exception as e:
+                logging.warning(
+                    f"Alternative cached GenBank file exists but could not be parsed: "
+                    f"{alt_file}. Error: {e}"
+                )
+                self.full_record = None
+
+        # ------------------------------------------------------------
+        # 4. Remote NCBI fallback: download and save as <accession>.gb
+        # ------------------------------------------------------------
+        logging.info(f"Downloading GenBank record for {self.genome_accession} from NCBI...")
+
+        record_text = None
+
+        for attempt in range(self.req_limit):
+            try:
+                handle = Entrez.efetch(
+                    db="nuccore",
+                    id=target_acc,
+                    strand=1,
+                    seq_start="begin",
+                    seq_stop="end",
+                    rettype="gbwithparts",
+                    retmode="text"
+                )
+
+                record_text = handle.read()
+                handle.close()
+                time.sleep(self.sleep_time)
+                break
+
+            except Exception as e:
+                logging.warning(
+                    f"NCBI exception on attempt {attempt + 1}/{self.req_limit} "
+                    f"for {self.genome_accession}: {e}"
+                )
+                time.sleep(self.sleep_time)
+
+        if not record_text:
+            logging.error(
+                f"Could not download GenBank record for {self.genome_accession} "
+                f"after {self.req_limit} attempts."
+            )
+            self.full_record = None
+            self.species_name = "Unknown Species"
+            return
+
+        try:
+            with open(record_file, "w", encoding="utf-8") as handle:
+                handle.write(record_text)
+
+            with open(record_file, "r", encoding="utf-8") as handle:
+                self.full_record = SeqIO.read(handle, "genbank")
+
+            self.species_name = self.full_record.annotations.get("organism", "Unknown Species")
+            logging.info(
+                f"Downloaded and cached remote record for {self.genome_accession} "
+                f"as {os.path.basename(record_file)}"
+            )
+
+        except Exception as e:
+            logging.error(
+                f"Error writing or parsing downloaded GenBank record for "
+                f"{self.genome_accession}: {e}"
+            )
+            self.full_record = None
+            self.species_name = "Unknown Species"
 
     def fetch_hit_features(self, margin_limit=20, max_attempts=5, mult_factor=3):
         '''
@@ -136,6 +278,12 @@ class GenomeFragment:
         -------
         None - features are set internally for each hit object. 
         '''
+
+        # If file doesn't exist in local mode we don't pass None, but abbort.
+        if self.full_record is None:
+            import logging
+            logging.error(f"Skipping feature mapping for {self.genome_accession} - Record not available locally.")
+            return
 
         #Fetch the feature for each hit
         for hit in self.hits:
@@ -241,7 +389,7 @@ class GenomeFragment:
                 purged_hits.append(hit)
                 seen_accessions.add(hit.protein_accession)
             else:
-                logging.debug(f"DUPLICATE REMOVED: {hit.protein_accession} on {hit.hit_accession}")
+                logging.debug(f"DUPLICATE REMOVED: {hit.protein_accession} on {hit.genome_accession} (Locus Tag: {hit.locus_tag})")
         
         self.hits = purged_hits
         logging.info(f"Purging hits... Post-purge count: {len(self.hits)}")

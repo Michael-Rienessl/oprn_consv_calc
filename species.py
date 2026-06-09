@@ -10,6 +10,8 @@ import re
 import os
 import math
 import logging
+import itertools
+
 
 import operon
 
@@ -122,11 +124,10 @@ class Species:
             self.genome_fragments.append(genome_fragment)
 
 
-    def measure_sim(self, reference_operon):
+    def measure_sim(self, reference_operon, allow_permutations=False):
         '''
-        Calculates two types of structural conservation:
-        1. Total Genomic SIM: A global score normalized by gene frequency (Paper Logic).
-        2. Best Operon SIM: Identifies the single best-preserved operon fragment.
+        Calculates Total Genomic SIM and identifies the best operon.
+        Includes Discovery Mode to test all permutations strictly.
 
         Detailed Workflow:
             1. Pair Generation: Creates unique pairs from the reference_operon accessions.
@@ -167,24 +168,16 @@ class Species:
         float: The Total Genomic SIM score (also stored in self.sim_score).
         '''
 
-        # 1. Setup Reference Pairs
-        ref_pairs = []
-        for i in range(len(reference_operon)-1):
-            ref_pairs.append((reference_operon[i], reference_operon[i+1]))
-
-        logging.info(f"    [Struct] Perfect Reference Pairs: {ref_pairs}")
-
-        # 2. Global Gene Counting (for Total Genomic SIM normalization)
+        # 1. Global Gene Counting (for Total Genomic SIM normalization)
         species_query_count = {acc: 0 for acc in reference_operon}
         for frag in self.genome_fragments:
             for hit in frag.hits:
                 if hit.query_accession in species_query_count:
                     species_query_count[hit.query_accession] += 1
         
-        # Store for summarized output
         self.query_hits_counts = species_query_count
 
-        # 3. Analyze Fragments and Find Best Operon
+        # 2. Analyze Fragments and Find Best Operon
         species_pairs = []
         self.best_operon = None
         max_local_sim = -1.0
@@ -192,43 +185,52 @@ class Species:
 
         for frag in self.genome_fragments:
             for operon in frag.operons:
-                # Use the new method from operon.py (Step 1)
-                operon.calculate_local_stats(ref_pairs)
+                # Calculate local stats (which includes the new logic in operon.py)
+                operon.calculate_local_stats(reference_operon, allow_permutations)
                 
-                # Logic to identify the Best Operon in the species
+                # We continue to evaluate the best operon based on the STRICT reference SIM
                 if (operon.local_sim > max_local_sim) or \
                    (operon.local_sim == max_local_sim and operon.local_aai > max_local_aai):
                     max_local_sim = operon.local_sim
                     max_local_aai = operon.local_aai
                     self.best_operon = operon
 
-                # Collect observed pairs for the Total SIM math
-                # We only count features that are actual BLAST hits (AnnotatedHit)
-                purged = [f for f in operon.features if isinstance(f, AnnotatedHit)]
-                if len(purged) > 1:
-                    for i in range(len(purged) - 1):
-                        species_pairs.append((purged[i].query_accession, purged[i+1].query_accession))
+                # Extract hits to build species pairs for global calculation
+                hits = [f for f in operon.features if isinstance(f, AnnotatedHit)]
+                if len(hits) > 1:
+                    for i in range(len(hits) - 1):
+                        species_pairs.append((hits[i].query_accession, hits[i+1].query_accession))
 
-        logging.info(f"    [Struct] Found Pairs in {self.species_name}: {species_pairs}")
-        
-        # 4. Total Genomic SIM Calculation (Paper-based)
-        weighted_num_match = 0
-        for ref_pair in ref_pairs:
-            # Count how many times this pair appears (both directions if needed)
-            num_occur = species_pairs.count(ref_pair) + species_pairs.count((ref_pair[1], ref_pair[0]))
+        logging.info(f"    [Struct] Found Normalized Pairs in {self.species_name}: {species_pairs}")
+
+        # 3. HELPER FUNCTION: Strict Global-SIM calculation for any given sequence
+        def calc_strict_global_sim(ref_order):
+            ref_pairs_temp = [(ref_order[i], ref_order[i+1]) for i in range(len(ref_order)-1)]
+            weighted_match = 0.0
             
-            # Max possible is the "bottleneck" (minimum count of the two genes)
-            max_possible_occur = min(species_query_count[ref_pair[0]], species_query_count[ref_pair[1]])
+            for rp in ref_pairs_temp:
+                num_occur = species_pairs.count(rp)
+                max_possible = min(species_query_count[rp[0]], species_query_count[rp[1]])
+                if max_possible > 0:
+                    weighted_match += (num_occur / max_possible)
+                    
+            return weighted_match / len(ref_pairs_temp) if ref_pairs_temp else 0.0
 
-            if max_possible_occur > 0:
-                added_weight = (num_occur / max_possible_occur)
-                weighted_num_match += added_weight
-                logging.info(f"    [Struct] Pair {ref_pair} Math: Found {num_occur} / Max {max_possible_occur} -> Weight: {added_weight:.2f}")
-            else:
-                logging.info(f"    [Struct] Pair {ref_pair} Math: Max possible is 0 -> Weight: 0.00")
+        # 4. Standard SIM (Total Genomic SIM calculated based on original JSON input)
+        self.sim_score = calc_strict_global_sim(reference_operon)
 
-        # 5. Finalize
-        self.sim_score = weighted_num_match / len(ref_pairs) if ref_pairs else 0.0
+        # 5. Discovery Mode: Test ALL permutations to find the best global structure
+        self.best_perm_global_sim = self.sim_score
+        self.best_perm_global_order = "-".join(reference_operon)
+
+        if allow_permutations:
+            logging.info("    [Struct] Discovery Mode: Evaluating all permutations for global SIM.")
+            for perm in itertools.permutations(reference_operon):
+                perm_sim = calc_strict_global_sim(perm)
+                if perm_sim > self.best_perm_global_sim:
+                    self.best_perm_global_sim = perm_sim
+                    self.best_perm_global_order = "-".join(perm)
+                    
         return self.sim_score
 
     def extract_taxids(self):

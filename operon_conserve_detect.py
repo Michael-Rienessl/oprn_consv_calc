@@ -11,7 +11,7 @@ from Bio.Seq import Seq
 from Bio.Blast.Applications import NcbitblastnCommandline
 from Bio.SeqRecord import SeqRecord
 from Bio.Blast import NCBIWWW, NCBIXML
-from features import AnnotatedHit, GenomeFeature
+from features import AnnotatedHit, GenomeFeature    
 from genome_fragment import GenomeFragment
 from species import Species
 from tqdm import tqdm
@@ -34,17 +34,14 @@ import socket
 
 socket.setdefaulttimeout(60)
 
-
-# --- LOGGING SETUP ---
-# Erstellt eine Datei "pipeline_test_log.txt" im gleichen Ordner
 log_file = "pipeline_test_log.txt"
 
 logging.basicConfig(
-    level=logging.DEBUG, # Zeichnet ALLES auf (Infos, Warnungen, Fehler, Debug-Werte)
+    level=logging.DEBUG,
     format='%(asctime)s | %(levelname)-8s | %(message)s',
     handlers=[
-        logging.FileHandler(log_file, mode='w'), # mode='w' überschreibt das Log bei jedem Neustart
-        logging.StreamHandler()                  # Gibt es parallel in der Konsole aus
+        logging.FileHandler(log_file, mode='w'),
+        logging.StreamHandler()
     ]
 )
 
@@ -127,6 +124,136 @@ reference_blast_db = './reverse_blast/{ref_assembly_accession}/{ref_assembly_acc
 
 #The list of species
 species = []
+
+# Local GenBank index for fast local runs.
+# Built once per run, then reused for metadata lookup and record loading.
+LOCAL_GBK_INDEX = None
+
+allow_permutations = False
+query_name_map = {}
+
+
+def _is_informative_blast_identifier(value):
+    """
+    Return True if a BLAST identifier is useful as a biological/accession ID.
+
+    Important:
+    - Reject BLAST-internal ordinal IDs such as BL_ORD_ID.
+    - Reject database-wrapper tokens such as gnl/ref/gb/lcl when they occur alone.
+    - Reject pure numeric ordinal IDs.
+    - Do NOT remove user/database prefixes such as RefSeq_, PLSDB_, or NZ_.
+    """
+    if value is None:
+        return False
+
+    s = str(value).strip()
+
+    if not s:
+        return False
+
+    bad_values = {
+        "No",
+        "N/A",
+        "NA",
+        "-",
+        "None",
+        "BL_ORD_ID",
+        "gnl",
+        "lcl",
+        "ref",
+        "gb",
+        "emb",
+        "dbj",
+        "pir",
+        "sp",
+    }
+
+    if s in bad_values:
+        return False
+
+    if s.startswith("BL_ORD_ID"):
+        return False
+
+    if s.startswith("gnl|BL_ORD_ID"):
+        return False
+
+    # BLAST ordinal identifiers are often pure integers after splitting
+    # gnl|BL_ORD_ID|123. These are not biological accessions.
+    if s.isdigit():
+        return False
+
+    return True
+
+
+def extract_blast_hit_accession(alignment):
+    """
+    Extract the nucleotide accession / FASTA record ID from a BLAST alignment
+    object without database-specific rewriting.
+
+    This function is robust to local BLAST databases built without
+    makeblastdb -parse_seqids. In that case BLAST XML often reports:
+
+        hit_id  = gnl|BL_ORD_ID|123
+        hit_def = RefSeq_NZ_CP....1 ...
+
+    The biological record ID is then the first token of hit_def, not "gnl",
+    "BL_ORD_ID", or "123".
+
+    This function does NOT strip RefSeq_, PLSDB_, NZ_, or version suffixes.
+    """
+
+    hit_id = str(getattr(alignment, "hit_id", "")).strip()
+    accession = str(getattr(alignment, "accession", "")).strip()
+    hit_def = str(getattr(alignment, "hit_def", "")).strip()
+
+    # 1. Local BLAST without -parse_seqids:
+    #    gnl|BL_ORD_ID|123 is an internal ordinal ID.
+    #    The original FASTA header is in hit_def.
+    if (
+        hit_id.startswith("gnl|BL_ORD_ID")
+        or hit_id.startswith("BL_ORD_ID")
+        or accession.startswith("BL_ORD_ID")
+    ):
+        if hit_def:
+            first_token = hit_def.split()[0].strip()
+            if _is_informative_blast_identifier(first_token):
+                return first_token
+
+    # 2. NCBI/BLAST pipe-style IDs, e.g. ref|NC_000000.1| or gb|CP000000.1|
+    #    Try the biologically meaningful accession-like fields, but skip wrapper
+    #    tokens such as ref, gb, gnl, and BL_ORD_ID.
+    if "|" in hit_id:
+        parts = [str(x).strip() for x in hit_id.split("|") if str(x).strip()]
+
+        # Prefer the second field for standard NCBI IDs:
+        # ref|NC_000000.1| -> NC_000000.1
+        if len(parts) >= 2 and _is_informative_blast_identifier(parts[1]):
+            return parts[1]
+
+        # Otherwise scan all parts for the first informative identifier.
+        for candidate in parts:
+            if _is_informative_blast_identifier(candidate):
+                return candidate
+
+    # 3. Simple local FASTA IDs may appear directly as hit_id.
+    if _is_informative_blast_identifier(hit_id):
+        return hit_id
+
+    # 4. Biopython's accession field is useful for remote BLAST, but in local
+    #    BLAST it can be BL_ORD_ID. Use it only if informative.
+    if _is_informative_blast_identifier(accession):
+        return accession
+
+    # 5. Last local fallback: first hit_def token is usually the original FASTA ID.
+    if hit_def:
+        first_token = hit_def.split()[0].strip()
+        if _is_informative_blast_identifier(first_token):
+            return first_token
+
+    raise ValueError(
+        f"Could not extract a usable BLAST hit accession. "
+        f"hit_id={hit_id!r}, accession={accession!r}, hit_def={hit_def!r}"
+    )
 
 def load_reference_from_local_genbank(genbank_path, cds_select):
     """
@@ -469,7 +596,7 @@ def search_blast(
         for record in blast_records[0].alignments:
 
             current_hit_def = re.sub('[^A-Za-z0-9]+', '_', record.hit_def)
-            curr_hit_rec = record.hit_id.split('|')[-2]
+            curr_hit_rec = extract_blast_hit_accession(record)
             print("\t\t|~> Analyzing hit " + str(curr_hit_rec))
 
             for hit in record.hsps:
@@ -545,7 +672,7 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
     
     Returns
     -------
-    annotated_hits: list[AnnotateHit.object]
+    annotated_hits: list[AnnotatedHit.object]
         A list of AnnotatedHit.objects that hold metadata for each of the BLAST hits.
     '''
 
@@ -566,49 +693,72 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
             f"Expected files like '{db_prefix}.nin'/'{db_prefix}.nsq' (nucl) or '{db_prefix}.pin'/'{db_prefix}.psq' (prot)."
         )
 
-    #Get the fasta record for the input record
+    # Get the fasta record for the input record
     global input_record_type
+    global reference_database_mode
+    global ref_features
     fasta_record = None
 
     if input_record_type == "translation":
         print("\t|~> Input is a raw amino acid sequence. Skipping NCBI download.")
-        # Wir bauen uns das FASTA-Format einfach selbst
+        # Create a basic FASTA format string
         dummy_id = "SEQ_" + str(input_record)[:10]
         fasta_record = f">{dummy_id}\n{input_record}\n"
+        
+    elif reference_database_mode == "local" and ref_features:
+        print("\t|~> Local reference mode detected. Extracting sequence from local GenBank reference.")
+        # Find the feature in our pre-loaded local reference
+        feat = None
+        for f in ref_features:
+            if getattr(f, "locus_tag", None) == input_record or getattr(f, "protein_accession", None) == input_record:
+                feat = f
+                break
+                
+        if feat is None:
+            raise ValueError(f"Local reference mode: could not find feature for '{input_record}' in ref_features.")
+            
+        aa_seq = getattr(feat, "aa_sequence", None)
+        if not aa_seq or aa_seq == 'None':
+            raise ValueError(f"Local reference mode: feature '{input_record}' has no translation available.")
+            
+        # Build the FASTA string directly from the local sequence
+        fasta_record = f">{input_record}\n{aa_seq}\n"
+        
     else:
-        # Get the fasta record for the input record via NCBI
+        # Remote mode: Get the fasta record for the input record via NCBI
+        print("\t|~> Remote mode: Fetching sequence from NCBI...")
         for i in range(REQUEST_LIMIT):
             try:
                 handle = Entrez.efetch(db='protein', id=input_record, retmode='fasta', rettype='fasta')        
                 fasta_record = handle.read()
-                time.sleep( SLEEP_TIME)
+                time.sleep(SLEEP_TIME)
                 break
             except Exception as e:
                 print(f"\t\tNCBI exception raised on attempt {i+1} for {input_record}: {e}\n\t\treattempting now...")
                 if i == (REQUEST_LIMIT - 1):
                     print(f"\t\tCould not download record after {REQUEST_LIMIT} attempts")
 
-    #Check if the fasta record was pulled successfully
+    # Check if the fasta record was pulled successfully
     if fasta_record == None:
         print('\t\tFasta record could not be downloaded for ' + str(input_record))
         return None
     
     os.makedirs('./local_blast_bin/', exist_ok=True)
     
-    #Write the FASTA record to a temporary input file for the local blast search
+    # Write the FASTA record to a temporary input file for the local blast search
     record_fasta_file = './local_blast_bin/temp_in.fasta'
     with open(record_fasta_file, 'w') as file:
         file.write(fasta_record)
     
-    #Get the query length that will be used to calculate the coverage later
+    # Get the query length that will be used to calculate the coverage later
     record_fasta = SeqIO.read(open(record_fasta_file,'r'),'fasta')
     query_length = len(record_fasta.seq)
 
 
-    print('Downloaded query sequence: ' + str(input_record))
+    print('Downloaded/Extracted query sequence: ' + str(input_record))
 
-    #Conduct the local BLAST search
-    blast_command = NcbitblastnCommandline(query=record_fasta_file, db=db_path, evalue=e_cutoff, outfmt=5, out="./local_blast_bin/out.xml")
+    # Conduct the local BLAST search
+    blast_command = NcbitblastnCommandline(query=record_fasta_file, db=db_path, evalue=e_cutoff, outfmt=5, out="./local_blast_bin/out.xml", max_target_seqs=max_hits)
     
     try:
         blast_command()
@@ -621,7 +771,7 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
 
     print('Parsing through local BLAST results ' + str(input_record) + '...')
 
-    #List of annotated hits to return
+    # List of annotated hits to return
     return_hits = []
 
     print("\t|~> Extracting hits from BLAST results...")
@@ -631,16 +781,15 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
         return return_hits
 
     for record in blast_records[0].alignments:
-        hit_def_parts = record.hit_def.split(' ')
-        current_hit_def = re.sub('[^A-Za-z0-9]+', '_', hit_def_parts[1] if len(hit_def_parts) > 1 else hit_def_parts[0])
-        curr_hit_rec = hit_def_parts[0]
+        curr_hit_rec = extract_blast_hit_accession(record)
+        current_hit_def = re.sub('[^A-Za-z0-9]+', '_', record.hit_def)
         
         print("\t\t|~> Analyzing hit " + str(curr_hit_rec))
         
-        #Iterate through the hits
+        # Iterate through the hits
         for hit in record.hsps:
 
-            #Initiates a AnnotatedHit object if set by the parameters.
+            # Initiates a AnnotatedHit object if set by the parameters.
             a_hit = AnnotatedHit(
                 query_accession=input_record, 
                 hit_accession=curr_hit_rec, 
@@ -661,7 +810,7 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
                     return_hits.append((input_record, curr_hit_rec, record))
                 continue
 
-            #Calculate the coverage for the current hit                  
+            # Calculate the coverage for the current hit                  
             cov = (hit.query_end - hit.query_start + 1) / (query_length)
             print('\t\t\tCoverage value: ' + str(cov))
             
@@ -712,6 +861,9 @@ def load_input_file(filename):
 
     global local_db_path
     local_db_path = file_reader['blast'][0].get('local_db_path', '')
+
+    global local_genomes_dir
+    local_genomes_dir = file_reader['blast'][0].get('local_genomes_dir', '')
 
     global tax_include
     tax_include = file_reader['blast'][0].get('tax_include', [])
@@ -772,6 +924,9 @@ def load_input_file(filename):
 
     global ref_threshold_margin
     ref_threshold_margin = file_reader['operon_assembly'][0]['ref_limit_margin']
+
+    global allow_permutations
+    allow_permutations = file_reader['operon_assembly'][0].get('allow_permutations', False)
 
     # ----------------------------
     # Other parameters
@@ -834,6 +989,14 @@ def load_input_file(filename):
         input_cfg = file_reader['input_records']
         input_record_type = input_cfg.get('type', None)
         input_records = input_cfg.get('values', None)
+
+        global query_name_map
+        query_name_map = {}
+        input_names = input_cfg.get('names', [])
+        for i, val in enumerate(input_records):
+            # If no name is defined, just use the accession as the name
+            name = input_names[i] if i < len(input_names) else val
+            query_name_map[val] = name
 
         if not input_record_type:
             raise KeyError("input_records.type is missing")
@@ -904,7 +1067,7 @@ def load_input_file(filename):
     os.makedirs(cache_dir, exist_ok=True)
     
 
-def write_all_out(species_list, query_accessions, output_path):
+def write_all_out(species_list, query_accessions, output_path, allow_permutations):
     '''
     Writes the results into two separate CSV files: 
     1. Summary: Best operon and genomic totals per species.
@@ -913,31 +1076,51 @@ def write_all_out(species_list, query_accessions, output_path):
     import csv
     import os
 
-    summary_file = output_path.replace(".csv", "_summary.csv")
+    summary_file = os.path.join(output_path, "output_summary.csv")
+
+    # Generate the string for the user-passed reference order once
+    reference_order_str = "-".join([query_name_map.get(acc, acc) for acc in query_accessions])
 
     # WRITE SUMMARY FILE
     with open(summary_file, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
+        writer = csv.writer(csvfile, delimiter=';')
         
+        # 1. Setup the exact header order requested
         header = [
             'Species', 
             'TaxID', 
             'Assembly_Accession', 
             'Best_Operon_Nucleotide_ID', 
-            'Best_Operon_SIM', 
-            'Total_Genomic_SIM', 
-            'Best_Operon_Avg_AAI', 
-            'Global_Total_Avg_AAI'
+            'Reference_Order',
+            'Best_Operon_SIM',
+            'Total_Genomic_SIM'
         ]
         
+        if allow_permutations:
+            header.extend([
+                'Best_Permutation',
+                'Best_Permutation_SIM',
+                'Total_Permutation_SIM'
+            ])
+
+        header.extend([
+            'Best_Operon_Avg_AAI', 
+            'Global_Total_Avg_AAI'
+        ])
+        
+        # Add dynamic AAI columns
         for q_acc in query_accessions:
-            header.append(f'Best_Op_{q_acc}_AAI')
+            name = query_name_map.get(q_acc, q_acc)
+            header.append(f'Best_Op_{name}_AAI')
             
+        # Add dynamic Count columns
         for q_acc in query_accessions:
-            header.append(f'Total_Count_{q_acc}')
+            name = query_name_map.get(q_acc, q_acc)
+            header.append(f'Total_Count_{name}')
             
         writer.writerow(header)
 
+        # 2. Populate the rows
         for sp in species_list:
             row = []
             row.append(sp.species_name)
@@ -946,28 +1129,49 @@ def write_all_out(species_list, query_accessions, output_path):
             
             if sp.best_operon:
                 row.append(sp.best_operon.genome_accession)
-            else:
-                row.append('N/A')
-
-            if sp.best_operon:
+                row.append(reference_order_str)
                 row.append(f"{sp.best_operon.local_sim * 100:.1f}%")
                 row.append(f"{sp.sim_score * 100:.1f}%")
-                row.append(f"{sp.best_operon.local_aai * 100:.1f}%")
-            else:
-                row.extend(["0.0%", f"{sp.sim_score * 100:.1f}%", "0.0%"])
 
+                if allow_permutations:
+                    # Best Permutation (Local Operon)
+                    raw_best_perm = getattr(sp.best_operon, 'best_perm_order', "").split("-")
+                    mapped_best_perm = [query_name_map.get(acc, acc) for acc in raw_best_perm if acc]
+                    row.append("-".join(mapped_best_perm) if mapped_best_perm else "N/A")
+
+                    # Best Permutation SIM
+                    row.append(f"{getattr(sp.best_operon, 'best_perm_local_sim', 0.0) * 100:.1f}%")
+
+                    # Total Permutation SIM (Global)
+                    row.append(f"{getattr(sp, 'best_perm_global_sim', 0.0) * 100:.1f}%")
+
+                row.append(f"{sp.best_operon.local_aai * 100:.1f}%")
+                
+            else:
+                # Fallback if no operon fragment was assembled at all
+                fallback_row = ['N/A', reference_order_str, "0.0%", f"{sp.sim_score * 100:.1f}%"]
+                
+                if allow_permutations:
+                    fallback_row.extend(["N/A", "0.0%", f"{getattr(sp, 'best_perm_global_sim', 0.0) * 100:.1f}%"])
+                    
+                fallback_row.append("0.0%")
+                row.extend(fallback_row)
+
+            # Global Total Avg AAI
             global_aai = getattr(sp, 'total_avg_aai_calculated', 0.0)
             row.append(f"{global_aai * 100:.2f}%")
 
+            # Dynamic AAI values per gene
             for q_acc in query_accessions:
                 aai_val = "N/A"
                 if sp.best_operon:
                     for feat in sp.best_operon.features:
-                        if isinstance(feat, AnnotatedHit) and feat.query_accession == q_acc:
+                        if hasattr(feat, 'query_accession') and feat.query_accession == q_acc:
                             aai_val = f"{feat.percent_identity * 100:.1f}%"
                             break
                 row.append(aai_val)
 
+            # Dynamic Counts per gene
             for q_acc in query_accessions:
                 count = sp.query_hits_counts.get(q_acc, 0)
                 row.append(count)
@@ -976,140 +1180,415 @@ def write_all_out(species_list, query_accessions, output_path):
         
 def append_detailed_out(sp, query_accessions, detailed_path):
     '''
-    Appends the operon fragments of a single species to the detailed CSV.
+    Appends the operon fragments of a single species/assembly group to the detailed CSV.
+
+    Important:
+    The detailed table is fragment-level / nucleotide-accession-level.
+    Therefore, Assembly_Accession is written explicitly so that the detailed table
+    can be compared directly against output_summary.csv.
     '''
     import csv
     import os
-    from features import AnnotatedHit # Sicherstellen, dass der Import vorhanden ist
+    from features import AnnotatedHit
 
     file_exists = os.path.isfile(detailed_path)
-    
+
     with open(detailed_path, 'a', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        
+
         if not file_exists:
-            header = ['Species', 'Nucleotide Accession', 'Fragment_SIM', 'Fragment_Avg_AAI']
+            header = [
+                'Species',
+                'TaxID',
+                'Assembly_Accession',
+                'Nucleotide Accession',
+                'Fragment_SIM',
+                'Fragment_Avg_AAI'
+            ]
+
             for q_acc in query_accessions:
+                name = query_name_map.get(q_acc, q_acc)
                 header.extend([
-                    f'{q_acc}_AAI', 
-                    f'{q_acc}_Accession', 
-                    f'{q_acc}_Start', 
-                    f'{q_acc}_Stop', 
-                    f'{q_acc}_Strand'
+                    f'{name}_AAI',
+                    f'{name}_Accession',
+                    f'{name}_Start',
+                    f'{name}_Stop',
+                    f'{name}_Strand'
                 ])
+
+            header.append('Genetic_Order')
             writer.writerow(header)
 
         for frag in sp.genome_fragments:
             for operon in frag.operons:
                 row = [
-                    sp.species_name, 
-                    operon.genome_accession, 
-                    f"{operon.local_sim * 100:.1f}%", 
+                    sp.species_name,
+                    getattr(frag, 'taxid', getattr(sp, 'taxid', 'N/A')),
+                    getattr(frag, 'assembly_accession', getattr(sp, 'assembly_accession', 'N/A')),
+                    operon.genome_accession,
+                    f"{operon.local_sim * 100:.1f}%",
                     f"{operon.local_aai * 100:.1f}%"
                 ]
-                
+
                 for q_acc in query_accessions:
                     found_hit = None
+
                     for feat in operon.features:
                         if isinstance(feat, AnnotatedHit) and feat.query_accession == q_acc:
                             found_hit = feat
                             break
-                    
+
                     if found_hit:
                         row.extend([
-                            f"{found_hit.percent_identity * 100:.1f}%", 
-                            found_hit.protein_accession, 
-                            found_hit.five_end, 
-                            found_hit.three_end, 
+                            f"{found_hit.percent_identity * 100:.1f}%",
+                            found_hit.protein_accession,
+                            found_hit.five_end,
+                            found_hit.three_end,
                             found_hit.strand
                         ])
                     else:
                         row.extend(['N/A', 'N/A', 'N/A', 'N/A', 'N/A'])
-                
+
+                order_list = []
+
+                for feat in operon.features:
+                    if isinstance(feat, AnnotatedHit):
+                        n = query_name_map.get(feat.query_accession, feat.query_accession)
+                        order_list.append(n)
+
+                row.append("-".join(order_list))
+
                 writer.writerow(row)
 
 def run_itol_pipeline():
-        """
-        Run the iTOL tree/dataset generation script after output.csv has been written.
+    """
+    Run the iTOL tree/dataset generation script after output.csv has been written.
+    Now includes a step to generate a true phylogenetic tree using Sourmash,
+    separated into 'taxonomic' and 'phylogenetic' folders.
+    """
+    global output_dir
+    global EMAIL
+    global E_API
+    global blast_type
 
-        The iTOL files are written into a folder named 'itol' next to the main output.csv.
-        """
+    output_csv = os.path.join(output_dir, "output_summary.csv")
+    if not os.path.exists(output_csv):
+        print("iTOL pipeline skipped: output_summary.csv was not found.")
+        return
 
-        global output_dir
-        global EMAIL
-        global E_API
+    itol_outdir = os.path.join(output_dir, "itol")
+    os.makedirs(itol_outdir, exist_ok=True)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Path to the CSV written by write_all_out()
-        output_csv = os.path.join(output_dir, "output_summary.csv")
-
-        if not os.path.exists(output_csv):
-            print("iTOL pipeline skipped: output_summary.csv was not found.")
-            return
-
-        # Create output_dir/itol
-        itol_outdir = os.path.join(output_dir, "itol")
-        os.makedirs(itol_outdir, exist_ok=True)
-
-        # Path to the iTOL script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        itol_script = os.path.join(script_dir, "itol_pipeline", "build_itol_tree_and_datasets.py")
-
-        if not os.path.exists(itol_script):
-            print("iTOL pipeline skipped: build_itol_tree_and_datasets.py was not found.")
-            print("Expected at:", itol_script)
-            return
-
-        cmd = [
-            sys.executable,
-            itol_script,
-            output_csv,
-            "--email", EMAIL,
-            "--outdir", itol_outdir
-        ]
-
-        # Only pass API key if available
-        if E_API and str(E_API).strip() != "":
-            cmd.extend(["--api-key", E_API])
-
-        print("Running iTOL pipeline...")
-        print("Command:", " ".join(cmd))
-
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        if proc.returncode != 0:
-            print("iTOL pipeline failed.")
-            print(proc.stdout)
-            print(proc.stderr)
-        else:
-            print("iTOL pipeline finished successfully.")
-            print(proc.stdout)
-
-def fetch_nuccore_metadata(curr_acc):
-    '''
-    Fetches the assembly accession, species name, and taxid for a single nuccore accession.
-    Returns a lightweight dictionary to avoid holding heavy objects in memory.
-    '''
-    metadata = {
-        'assembly_accession': curr_acc, # Fallback
-        'taxid': '-1',
-        'species_name': None
-    }
+    # ==========================================================
+    # 1. Run Sourmash Phylogenetic Tree Builder
+    # ==========================================================
+    sourmash_script = os.path.join(script_dir, "itol_pipeline", "build_sourmash_tree.py")
+    phylo_dir = os.path.join(itol_outdir, "phylogenetic")
+    os.makedirs(phylo_dir, exist_ok=True)
+    nwk_out = os.path.join(phylo_dir, "sourmash_phylogenetic_tree.nwk")
     
-    logging.info(f"Downloading metadata records for {curr_acc}...")
+    gb_folder = os.path.join(output_dir, "sourmash_gb_files")
+
+    if os.path.exists(sourmash_script):
+        print("\n--- Running Sourmash Phylogenetic Tree Pipeline ---")
+        cmd_sm = [
+            sys.executable, sourmash_script,
+            "--input", gb_folder,
+            "--output", nwk_out,
+            "--csv", output_csv,
+            "--mode", blast_type
+        ]
+        proc_sm = subprocess.run(cmd_sm, capture_output=True, text=True)
+        if proc_sm.returncode != 0:
+            print("Sourmash pipeline failed.")
+            print(proc_sm.stderr)
+        else:
+            print(proc_sm.stdout)
+    else:
+        print(f"Sourmash skipped: {sourmash_script} not found.")
+
+    # ==========================================================
+    # 2. Run standard iTOL Dataset generation
+    # ==========================================================
+    itol_script = os.path.join(script_dir, "itol_pipeline", "build_itol_tree_and_datasets.py")
+
+    if not os.path.exists(itol_script):
+        print("iTOL pipeline skipped: build_itol_tree_and_datasets.py was not found.")
+        return
+
+    cmd_itol = [
+        sys.executable, itol_script,
+        output_csv,
+        "--outdir", itol_outdir,
+        "--email", EMAIL,
+        "--mode", blast_type
+    ]
+
+    print("\n--- Running iTOL Dataset Pipeline (Taxonomic & Phylogenetic) ---")
+    proc_itol = subprocess.run(cmd_itol, capture_output=True, text=True)
+
+    if proc_itol.returncode != 0:
+        print("iTOL pipeline failed.")
+        print(proc_itol.stdout)
+        print(proc_itol.stderr)
+    else:
+        print("iTOL pipeline finished successfully.")
+        print(proc_itol.stdout)
+
+def prepare_sourmash_files(csv_path, cache_dir, sourmash_input_dir):
+    """
+    Reads Nucleotide Accessions from the output CSV and copies the matching 
+    GenBank files from the cache directory to the sourmash input directory.
+    """
+
+    import pandas as pd
+    from pathlib import Path
+    
+    print("Preparing GenBank files for Sourmash...")
+    
+    csv_file = Path(csv_path).resolve()
+    
+    if not csv_file.exists():
+        print(f"Error: Could not find the CSV file at {csv_file}")
+        return
+            
+    # 1. Read CSV
+    try:
+        df = pd.read_csv(csv_file, sep=None, engine='python')
+        if len(df.columns) == 1:
+            df = pd.read_csv(csv_file, sep=';')
+    except Exception as e:
+        print(f"Error reading CSV file: {e}")
+        return
+    
+    # 2. Ensure we target the correct column (Checking multiple variations)
+    possible_cols = ["Assembly_Accession", "Nucleotide Accession", "Genome Assembly Accession"]
+    col_name = None
+    for col in possible_cols:
+        if col in df.columns:
+            col_name = col
+            break
+            
+    if not col_name:
+        print(f"Error: None of the expected accession columns found. Available columns: {list(df.columns)}")
+        return
+    
+    # Create a set of unique accessions (removing NaN values)
+    accessions = set(df[col_name].dropna().astype(str))
+    print(f"Found {len(accessions)} unique accessions in the CSV.")
+    
+    # 3. Prepare paths
+    cache_path = Path(cache_dir).resolve()
+    if not cache_path.exists():
+        print(f"Error: Cache directory '{cache_path}' does not exist!")
+        return
+        
+    target_path = Path(sourmash_input_dir).resolve()
+    target_path.mkdir(parents=True, exist_ok=True)
+    
+    # 4. Search cache and copy files
+    copied_files = 0
+    for acc in accessions:
+        matched_files = list(cache_path.glob(f"*{acc}*.gb*"))
+        
+        if not matched_files:
+            # Try without the version number (e.g., .1)
+            acc_base = acc.split('.')[0]
+            matched_files = list(cache_path.glob(f"*{acc_base}*.gb*"))
+            
+        for file_path in matched_files:
+            dest_file = target_path / file_path.name
+            if not dest_file.exists():
+                shutil.copy(file_path, dest_file)
+                copied_files += 1
+                
+    print(f"Successfully copied {copied_files} GenBank files to '{target_path}' for Sourmash.")
+
+
+def _extract_taxid_from_record(record):
+    """
+    Extract TaxID from the source feature of a GenBank record.
+    Returns '-1' if no TaxID is found.
+    """
+    for feature in record.features:
+        if feature.type != "source":
+            continue
+
+        for dbxref in feature.qualifiers.get("db_xref", []):
+            if str(dbxref).startswith("taxon:"):
+                return str(dbxref).split(":", 1)[1]
+
+    return "-1"
+
+
+def build_local_gbk_index(gbk_dir):
+    """
+    Build a strict local GenBank index once.
+
+    Strict local-mode rule:
+        - key = record.id exactly
+        - no prefix stripping
+        - no NZ_ removal
+        - no version removal
+        - no NCBI access
+
+    This assumes that the local BLAST FASTA headers were built from record.id.
+    """
+    import os
+    import glob
+    import logging
+    from Bio import SeqIO
+    from tqdm import tqdm
+
+    if not gbk_dir or not os.path.exists(gbk_dir):
+        raise FileNotFoundError(f"Local GenBank directory not found: {gbk_dir}")
+
+    valid_extensions = (".gb", ".gbk", ".gbff", ".genbank")
+
+    gb_files = [
+        f for f in glob.glob(os.path.join(gbk_dir, "*"))
+        if os.path.isfile(f) and f.lower().endswith(valid_extensions)
+    ]
+
+    if not gb_files:
+        raise FileNotFoundError(f"No GenBank files found in local directory: {gbk_dir}")
+
+    print(f"[OK] Building strict local GenBank index from {len(gb_files):,} files...")
+
+    index = {}
+
+    for gb_file in tqdm(gb_files, desc="Indexing local GBK files", unit="file"):
+        try:
+            for record in SeqIO.parse(gb_file, "genbank"):
+                record_id = str(record.id).strip()
+
+                if not record_id:
+                    logging.warning(f"Record without record.id in file: {gb_file}")
+                    continue
+
+                if record_id in index:
+                    logging.warning(
+                        f"Duplicate record.id detected: {record_id}. "
+                        f"Keeping first file: {index[record_id]['file_path']}; "
+                        f"ignoring duplicate in: {gb_file}"
+                    )
+                    continue
+
+                index[record_id] = {
+                    "file_path": gb_file,
+                    "record_id": record_id,
+
+                    # In local mode we do NOT collapse by NCBI assembly.
+                    # One nucleotide record / plasmid = one analysis group.
+                    "assembly_accession": record_id,
+
+                    "taxid": _extract_taxid_from_record(record),
+                    "species_name": record.annotations.get("organism", "Unknown Species"),
+                    "metadata_source": "local_gbk_index_exact"
+                }
+
+        except Exception as e:
+            logging.warning(f"Could not parse local GenBank file {gb_file}: {e}")
+
+    print(f"[OK] Strict local GenBank index contains {len(index):,} records.")
+
+    return index
+
+
+def fetch_local_gbk_metadata(curr_acc, gbk_dir):
+    """
+    Fast exact local metadata lookup.
+
+    Local mode:
+        - no NCBI
+        - no accession modification
+        - no folder scan per accession
+        - exact lookup by BLAST hit accession == GenBank record.id
+    """
+    import logging
+
+    global LOCAL_GBK_INDEX
+
+    if LOCAL_GBK_INDEX is None:
+        LOCAL_GBK_INDEX = build_local_gbk_index(gbk_dir)
+
+    key = str(curr_acc).strip()
+
+    if key in LOCAL_GBK_INDEX:
+        return dict(LOCAL_GBK_INDEX[key])
+
+    logging.warning(
+        f"No exact local GenBank metadata found for accession: {curr_acc}. "
+        f"This means the BLAST hit ID does not match any GenBank record.id."
+    )
+
+    return {
+        "assembly_accession": str(curr_acc),
+        "taxid": "-1",
+        "species_name": "Unknown Species",
+        "file_path": None,
+        "metadata_source": "local_fallback_exact_miss"
+    }
+
+def fetch_nuccore_metadata(curr_acc, allow_ncbi=True, local_gbk_dir=None):
+    '''
+    Fetches assembly accession, species name, and TaxID for a nucleotide accession.
+
+    Local mode:
+        - Does not contact NCBI.
+        - Does not modify the accession.
+        - Uses local GenBank metadata only.
+        - Falls back to assembly_accession = curr_acc if no metadata is found.
+
+    Remote mode:
+        - Uses NCBI nuccore / assembly metadata.
+        - Does not strip or rewrite the accession before querying.
+    '''
+
+    logging.info(f"Resolving metadata for {curr_acc}...")
+
+    # ------------------------------------------------------------
+    # 1. Local mode: no NCBI access
+    # ------------------------------------------------------------
+    if not allow_ncbi:
+        return fetch_local_gbk_metadata(curr_acc, local_gbk_dir)
+
+    # ------------------------------------------------------------
+    # 2. Remote mode fallback
+    # ------------------------------------------------------------
+    search_acc = str(curr_acc).strip()
+
+    metadata = {
+        'assembly_accession': search_acc,
+        'taxid': '-1',
+        'species_name': None,
+        'metadata_source': 'remote_fallback'
+    }
 
     records = None
+
     for i in range(REQUEST_LIMIT):
         try:
-            handle = Entrez.efetch(db="nuccore", id=curr_acc, rettype='gb', retmode='XML')
+            handle = Entrez.efetch(
+                db="nuccore",
+                id=search_acc,
+                rettype='gb',
+                retmode='XML'
+            )
             records = list(Entrez.read(handle, 'xml'))
             time.sleep(SLEEP_TIME)
             break
+
         except Exception as e:
-            logging.warning(f"NCBI efetch exception on attempt {i+1}/{REQUEST_LIMIT} for {curr_acc}: {e}")
+            logging.warning(
+                f"NCBI efetch exception on attempt {i+1}/{REQUEST_LIMIT} "
+                f"for {search_acc}: {e}"
+            )
             time.sleep(SLEEP_TIME * 2)
 
     if not records:
-        logging.error(f"Could not fetch data for {curr_acc}. Skipping metadata extraction.")
+        logging.error(f"Could not fetch NCBI metadata for {search_acc}. Using accession fallback.")
         return metadata
 
     record = records[0]
@@ -1119,47 +1598,76 @@ def fetch_nuccore_metadata(curr_acc):
     for info in record.get('GBSeq_xrefs', []):
         if info.get('GBXref_dbname') == 'Assembly':
             metadata['assembly_accession'] = info.get('GBXref_id')
+            metadata['metadata_source'] = 'remote_nuccore_xref'
             assembly_found = True
             break
 
     # 2) Fallback: nuccore -> assembly via elink
     if not assembly_found:
         link_records = None
+
         for attempt in range(REQUEST_LIMIT):
             try:
-                link_handle = Entrez.elink(dbfrom="nuccore", db="assembly", id=curr_acc)
+                link_handle = Entrez.elink(
+                    dbfrom="nuccore",
+                    db="assembly",
+                    id=search_acc
+                )
                 link_records = Entrez.read(link_handle)
                 time.sleep(SLEEP_TIME)
                 break
-            except Exception:
+
+            except Exception as e:
+                logging.warning(
+                    f"NCBI elink exception on attempt {attempt+1}/{REQUEST_LIMIT} "
+                    f"for {search_acc}: {e}"
+                )
                 time.sleep(SLEEP_TIME)
-        
+
         if link_records:
             asm_id = None
+
             for lr in link_records:
                 for lset in lr.get("LinkSetDb", []):
                     for link in lset.get("Link", []):
                         asm_id = link.get("Id")
-                        if asm_id: break
-                    if asm_id: break
-                if asm_id: break
+                        if asm_id:
+                            break
+                    if asm_id:
+                        break
+                if asm_id:
+                    break
 
             if asm_id:
                 for attempt in range(REQUEST_LIMIT):
                     try:
-                        sum_handle = Entrez.esummary(db="assembly", id=asm_id, retmode="xml")
+                        sum_handle = Entrez.esummary(
+                            db="assembly",
+                            id=asm_id,
+                            retmode="xml"
+                        )
                         sum_records = Entrez.read(sum_handle)
                         time.sleep(SLEEP_TIME)
+
                         try:
                             docsum = sum_records['DocumentSummarySet']['DocumentSummary'][0]
                             asm_acc = docsum.get('AssemblyAccession', None)
+
                             if asm_acc:
                                 metadata['assembly_accession'] = asm_acc
+                                metadata['metadata_source'] = 'remote_elink_assembly'
                                 assembly_found = True
+
                         except Exception:
                             pass
+
                         break
-                    except Exception:
+
+                    except Exception as e:
+                        logging.warning(
+                            f"NCBI assembly esummary exception on attempt {attempt+1}/{REQUEST_LIMIT} "
+                            f"for {search_acc}: {e}"
+                        )
                         time.sleep(SLEEP_TIME)
 
     # 3) TaxID + organism name from source feature
@@ -1170,6 +1678,7 @@ def fetch_nuccore_metadata(curr_acc):
                     val = qual.get('GBQualifier_value', '')
                     if val.startswith('taxon:'):
                         metadata['taxid'] = val.split(':', 1)[1]
+
                 if qual.get('GBQualifier_name') == 'organism':
                     metadata['species_name'] = qual.get('GBQualifier_value')
 
@@ -1195,10 +1704,25 @@ def process_frag(fragment, lock):
     try:
         fragment.fetch_record()
     except Exception as e:
-        print(f"[ERROR] fetch_record failed for {fragment.genome_fragment_accession}: {e}")
+        print(f"[ERROR] fetch_record failed for {fragment.genome_accession}: {e}")
+        return
+
+    if fragment.full_record is None:
+        logging.error(
+            f"[SKIP] No GenBank record loaded for {fragment.genome_accession}; "
+            "skipping feature mapping for this fragment."
+        )
         return
 
     fragment.fetch_features()
+
+    if fragment.full_record is None:
+        logging.error(
+            f"[SKIP] No GenBank record available after fetch_features for "
+            f"{fragment.genome_accession}; skipping fragment."
+        )
+        return
+
     fragment.fetch_hit_features(margin_limit=margin_limit, max_attempts=max_feature_detect_attempts, mult_factor=feature_search_mult_factor)
     fragment.purge_hits()
     fragment.assemble_operons(feature_limit=feature_limit, intergenic_limit=intergenic_limit)
@@ -1228,12 +1752,12 @@ def align_input_records_to_biology():
         if str(strand) == '-1' or str(strand) == '-':
             # MINUS STRAND: Transcription reads backwards (high to low coordinates)
             # We sort descending (reverse=True) using the highest coordinate of each gene
-            ref_features = sorted(ref_features, key=lambda x: max(x.five_end, x.three_end), reverse=True)
+            #ref_features = sorted(ref_features, key=lambda x: max(x.five_end, x.three_end), reverse=True)
             logging.info("Sorting reference operon for MINUS strand (descending coordinates).")
         else:
             # PLUS STRAND: Transcription reads forwards (low to high coordinates)
             # We sort ascending using the lowest coordinate of each gene
-            ref_features = sorted(ref_features, key=lambda x: min(x.five_end, x.three_end))
+            #ref_features = sorted(ref_features, key=lambda x: min(x.five_end, x.three_end))
             logging.info("Sorting reference operon for PLUS strand (ascending coordinates).")
 
         # Re-build input_records to match this physical sequence perfectly
@@ -1241,32 +1765,39 @@ def align_input_records_to_biology():
         
         # We use a set to avoid appending duplicates if a gene was fetched weirdly
         seen = set()
+
+        new_query_name_map = {}
         
         for feat in ref_features:
             target_id = None 
             if input_record_type == "locus_tag" and getattr(feat, 'locus_tag', None) in input_records:
+                original_val = getattr(feat, 'locus_tag', None)
                 target_id = getattr(feat, 'protein_accession', None)
                 if target_id in [None, 'None', '']:
                     target_id = getattr(feat, 'locus_tag', None)
                 
             elif input_record_type == "protein_accession" and getattr(feat, 'protein_accession', None) in input_records:
+                original_val = getattr(feat, 'protein_accession', None)
                 target_id = feat.protein_accession
                 
             elif input_record_type == "translation" and getattr(feat, 'aa_sequence', None):
                 for acc in input_records:
                     if acc in feat.aa_sequence or feat.aa_sequence in acc:
+                        original_val = acc
                         target_id = getattr(feat, 'protein_accession', getattr(feat, 'locus_tag', None))
                         break
             else:
                 # Fallback
                 for acc in input_records:
                     if acc == getattr(feat, 'locus_tag', None) or acc == getattr(feat, 'protein_accession', None):
+                        original_val = acc
                         target_id = getattr(feat, 'protein_accession', acc)
                         break
                         
             if target_id and target_id not in seen:
                 sorted_inputs.append(target_id)
                 seen.add(target_id)
+                new_query_name_map[target_id] = query_name_map.get(original_val, target_id)
 
         # Overwrite the global list with the newly found Protein IDs
         input_records = sorted_inputs
@@ -1370,7 +1901,8 @@ def process_reference():
             "A biological operon is not possible in this configuration. Please check your JSON input."
         )
 
-    align_input_records_to_biology()
+    if allow_permutations == False:
+        align_input_records_to_biology()
 
 def get_reference_intergenic_distance():
     '''
@@ -1596,7 +2128,6 @@ def make_reference_blastdb():
         print(f"\tBuilding reverse-BLAST DB from local GenBank: {reference_data}")
 
         reference_dir = os.path.dirname(reference_data)
-        reference_basename = os.path.basename(reference_data)
 
         # collect all GenBank-like files in the same directory
         gbk_pattern = ["*.gbk", "*.gb", "*.gbff", "*.genbank"]
@@ -1634,10 +2165,9 @@ def make_reference_blastdb():
                             if locus_tag not in [None, 'None', '']:
                                 protein_id = locus_tag
                             else:
-                                raise ValueError(
-                                    f"\n[CRITICAL ERROR] No 'protein_id' found for CDS feature (locus_tag: '{locus_tag}') in the local file '{gbk_file}'.\n"
-                                    f"Please ensure all CDS features in your local GenBank reference have valid 'protein_id' qualifiers, then try again."
-                                )
+                                # --- FIX: Don't crash the whole file, just skip this specific nameless CDS ---
+                                print(f"\t\t[WARN] Skipping a nameless CDS in {os.path.basename(gbk_file)} (no locus_tag or protein_id).")
+                                continue
 
                         translation = q.get("translation", [None])[0]
 
@@ -1834,6 +2364,76 @@ def make_reference_blastdb():
     created = glob.glob(db_prefix + ".*")
     if len(created) == 0:
         raise RuntimeError("makeblastdb reported success but no DB files were created.")
+    
+def build_local_database_from_gb_folder(input_folder, db_prefix, cache_directory):
+    '''
+    Automatically builds a local BLAST nucleotide database from a folder of GenBank files.
+    It uses a streaming approach to convert GBK to FASTA to minimize RAM usage.
+    '''
+    import os
+    import glob
+    import subprocess
+    from Bio import SeqIO
+    from tqdm import tqdm
+
+    print(f"\t|~> Automating local database creation from folder: {input_folder}")
+    
+    # 1. All GenBank files in the folder (with common extensions)
+    gb_files = []
+    for ext in ('*.gb', '*.gbk', '*.gbff'):
+        gb_files.extend(glob.glob(os.path.join(input_folder, ext)))
+    
+    if not gb_files:
+        raise FileNotFoundError(f"No GenBank files found in '{input_folder}'")
+    
+    os.makedirs(os.path.dirname(db_prefix), exist_ok=True)
+    os.makedirs(cache_directory, exist_ok=True)
+    
+    combined_fasta = db_prefix + "_combined.fasta"
+    record_count = 0
+    
+    print(f"\t|~> Parsing {len(gb_files)} GenBank files and writing FASTA on the fly...")
+    
+    # Open the combined FASTA file to stream the data into it
+    with open(combined_fasta, "w") as out_fasta:
+        
+        # We wrap the file loop in tqdm for a progress bar
+        for gb_file in tqdm(gb_files, desc="Converting to FASTA", unit="file"):
+            try:
+                for record in SeqIO.parse(gb_file, "genbank"):
+                    # Write FASTA header exactly as GenBank record.id.
+                    # This guarantees:
+                    # BLAST hit ID == GenBank record.id == pipeline Nucleotide Accession
+                    rec_id = str(record.id).strip()
+                    seq = str(record.seq)
+
+                    if not rec_id or not seq:
+                        continue
+
+                    out_fasta.write(f">{rec_id}\n")
+
+                    for i in range(0, len(seq), 80):
+                        out_fasta.write(seq[i:i + 80] + "\n")
+
+                    record_count += 1
+            except Exception as e:
+                # Use tqdm.write instead of print to avoid breaking the progress bar visually
+                tqdm.write(f"\t\t[WARN] Could not parse {gb_file}: {e}")
+                
+    if record_count == 0:
+        raise ValueError("No valid GenBank records could be parsed to build the database.")
+        
+    print(f"\t|~> Successfully wrote {record_count} sequences to combined FASTA.")
+    
+    # 2. Build the BLAST database
+    print(f"\t|~> Executing makeblastdb at {db_prefix}...")
+    cmd = ["makeblastdb", "-in", combined_fasta, "-dbtype", "nucl", "-parse_seqids", "-out", db_prefix]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if proc.returncode != 0:
+        raise RuntimeError(f"makeblastdb failed:\n{proc.stdout}\n{proc.stderr}")
+        
+    print("\t|~> Local database successfully built!")
 
 def _strip_version(acc):
     """
@@ -1953,6 +2553,8 @@ def check_reverse_blast(query_accession, annotated_hit):
     Accept if the TOP hit in the reference DB matches the original query_accession
     (or contains it, depending on header style).
     """
+    
+    logging.debug(f"Reverse BLAST check: accession={annotated_hit.genome_accession}, pos={annotated_hit.align_start}-{annotated_hit.align_end}")
 
     import os
     import subprocess
@@ -2008,12 +2610,11 @@ def check_reverse_blast(query_accession, annotated_hit):
     expected_ids = _get_expected_reverse_ids(query_accession)
     observed_ids = _extract_ids_from_reverse_hit(top)
 
-    # Debug output: keep this while testing
-    print(f"[RB DEBUG] query={query_accession}")
-    print(f"[RB DEBUG] expected_ids={sorted(expected_ids)}")
-    print(f"[RB DEBUG] top_hit_id={top.hit_id}")
-    print(f"[RB DEBUG] top_hit_def={top.hit_def}")
-    print(f"[RB DEBUG] observed_ids={sorted(observed_ids)}")
+    logging.debug(f"[RB DEBUG] query={query_accession}")
+    logging.debug(f"[RB DEBUG] expected_ids={sorted(expected_ids)}")
+    logging.debug(f"[RB DEBUG] top_hit_id={top.hit_id}")
+    logging.debug(f"[RB DEBUG] top_hit_def={top.hit_def}")
+    logging.debug(f"[RB DEBUG] observed_ids={sorted(observed_ids)}")
 
     if expected_ids.intersection(observed_ids):
         return True
@@ -2147,12 +2748,29 @@ def calc_operon_cons():
         get_reference_intergenic_distance()
         tqdm.write(str(intergenic_limit) + '\n')
 
+    
+    if blast_type == 'local' and local_genomes_dir != '':
+        if local_db_path == '':
+            local_db_path = './local_db/auto_nucl_db'
+            
+        # Check if the database files already exist (e.g. .nhr, .nin, .nsq for nucleotide DB)
+        import glob
+        existing_db_files = glob.glob(local_db_path + '.*')
+        
+        if len(existing_db_files) > 0:
+            tqdm.write(f'Local BLAST database already exists at {local_db_path}. Skipping build.')
+        else:
+            tqdm.write('Auto-building local BLAST database from GenBank files...')
+            build_local_database_from_gb_folder(local_genomes_dir, local_db_path, cache_dir)
+    # ----------------------------------------------------------------
+    
     ##Conduct BLAST search
 
     #Holds the hits from all of the BLAST searches
     final_hits = []
 
-    align_input_records_to_biology()
+    if allow_permutations == False:
+        align_input_records_to_biology()
 
     for record in input_records:
 
@@ -2210,10 +2828,26 @@ def calc_operon_cons():
             nuccore_to_hits[hit.genome_accession] = []
         nuccore_to_hits[hit.genome_accession].append(hit)
 
-    ## 2. Pre-process metadata for each unique nucleotide (Lightweight)
+    ## 2. Pre-process metadata for each unique nucleotide
     nuccore_metadata = {}
+
+    metadata_gbk_dir = cache_dir
+
+    if blast_type == 'local' and local_genomes_dir:
+        metadata_gbk_dir = local_genomes_dir
+
+    # Build local GenBank index once, not once per accession.
+    global LOCAL_GBK_INDEX
+
+    if blast_type == 'local':
+        LOCAL_GBK_INDEX = build_local_gbk_index(metadata_gbk_dir)
+
     for acc in tqdm(nuccore_to_hits.keys(), desc='Fetching Metadata'):
-        nuccore_metadata[acc] = fetch_nuccore_metadata(acc)
+        nuccore_metadata[acc] = fetch_nuccore_metadata(
+            acc,
+            allow_ncbi=(blast_type != 'local'),
+            local_gbk_dir=metadata_gbk_dir
+        )
 
     ## 3. Group nucleotide accessions by Assembly (Species)
     assembly_to_nuccore = {}
@@ -2231,19 +2865,30 @@ def calc_operon_cons():
     for asm, acc_list in tqdm(assembly_to_nuccore.items(), desc='Processing Species (Lazy Load)'):
         sp = Species(assembly_accession=asm)
         processing_threads = []
-
+    
         # A) Load only the fragments for THIS species into RAM
         for acc in acc_list:
             meta = nuccore_metadata[acc]
             frag_name = nuccore_to_hits[acc][0].genome_fragment_name
 
+            fragment_gbk_dir = cache_dir
+            if blast_type == 'local' and local_genomes_dir:
+                fragment_gbk_dir = local_genomes_dir
+
             frag = GenomeFragment(
-                name=frag_name, 
-                genome_fragment_accession=acc, 
-                req_limit=REQUEST_LIMIT, 
-                sleep_time=SLEEP_TIME, 
-                cache_directory=cache_dir
+                name=frag_name,
+                genome_fragment_accession=acc,
+                req_limit=REQUEST_LIMIT,
+                sleep_time=SLEEP_TIME,
+                cache_directory=fragment_gbk_dir,
+                allow_ncbi_download=(blast_type != 'local')
             )
+
+            # In local mode, use the file path found by the local GBK index.
+            # This prevents GenomeFragment.fetch_record() from scanning the whole folder again.
+            if blast_type == 'local':
+                frag.local_gbk_file_path = meta.get("file_path", None)
+
             frag.taxid = meta['taxid']
             frag.species_name = meta['species_name']
             frag.assembly_accession = asm
@@ -2275,7 +2920,7 @@ def calc_operon_cons():
             sp.extract_names()
             sp.extract_taxids()
             sp.extract_genome_accessions()
-            sp.measure_sim(input_records)
+            sp.measure_sim(input_records, allow_permutations)
             sp.total_avg_aai_calculated = sp.calculate_total_avg_aai()
 
             # C) Write directly to disk (Lazy Writing)
@@ -2297,17 +2942,23 @@ def calc_operon_cons():
             sp.clean()
 
     print("Writing output now...")
-    final_output_path = os.path.join(output_dir, "output.csv")
-    write_all_out(species, input_records, final_output_path)
+    write_all_out(species, input_records, output_dir, allow_permutations)
 
     if len(species) == 0:
-        print("Skipping iTOL pipeline: no species passed filtering, output.csv contains no data rows.")
+        print("Skipping pipelines: no species passed filtering, output_summary.csv contains no data rows.")
     else:
+        # 1. Prepare files for Sourmash
+        summary_csv_path = os.path.join(output_dir, "output_summary.csv")
+        
+        sourmash_dir = os.path.join(output_dir, "sourmash_gb_files")
+        prepare_sourmash_files(summary_csv_path, cache_dir, sourmash_dir)
+
         print("Generating iTOL tree and annotation datasets...")
         try:
-            run_itol_pipeline()
+            run_itol_pipeline()            
+
         except Exception as e:
-            print(f"iTOL pipeline failed: {e}")
+            print(f"Pipeline failed: {e}")
 
     #Get time elapsed
     end_time = datetime.datetime.now()

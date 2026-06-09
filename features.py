@@ -3,6 +3,8 @@
 
 '''
 
+from numpy import rint
+
 from Bio import Entrez
 import time
 import logging
@@ -128,40 +130,21 @@ class AnnotatedHit(GenomeFeature):
             feat_start = min(coding_start, coding_end)
             feat_end = max(coding_start, coding_end)
 
-            # Determine which is longer
-            long_start = int(align_five_end)
-            short_start = int(align_five_end)
-
-            long_end = int(align_three_end)
-            short_end = int(align_three_end)
-
-            if (align_three_end - align_five_end) > (feat_end - feat_start):
-                short_start = int(feat_start)
-                short_end = int(feat_end)
-            else:
-                long_start = int(feat_start)
-                long_end = int(feat_end)
-
-            # No overlap
-            if short_end < long_start or short_start > long_end:
-                continue
-
+            overlap_start = max(align_five_end, feat_start)
+            overlap_end = min(align_three_end, feat_end)
+            
             feat_coverage = -1
-
-            if short_start >= long_start and short_end <= long_end:
-                denom = (long_end - long_start)
+            
+            # If overlap_end is greater than or equal to overlap_start, a physical overlap exists
+            if overlap_start <= overlap_end:
+                overlap_length = overlap_end - overlap_start + 1
+                alignment_length = align_three_end - align_five_end + 1
+                feature_length = feat_end - feat_start + 1
+                
+                denom = max(alignment_length, feature_length)
                 if denom > 0:
-                    feat_coverage = (short_end - short_start) / denom
+                    feat_coverage = overlap_length / denom
 
-            elif short_start < long_start:
-                denom = (long_end - long_start)
-                if denom > 0:
-                    feat_coverage = (short_end - long_start) / denom
-
-            elif short_end > long_end:
-                denom = (long_end - long_start)
-                if denom > 0:
-                    feat_coverage = (long_end - short_start) / denom
 
             if feat_coverage > max_coverage_val:
                 max_coverage_val = feat_coverage
@@ -171,7 +154,7 @@ class AnnotatedHit(GenomeFeature):
             if feat_coverage > 0:
                 logging.debug(
                     f"Feature Check: {feature.qualifiers.get('locus_tag', [''])[0]} | "
-                    f"BLAST: {long_start}-{long_end} | GenBank: {short_start}-{short_end} | "
+                    f"BLAST: {align_five_end}-{align_three_end} | GenBank: {feat_start}-{feat_end} | "
                     f"Calculated Coverage: {feat_coverage:.4f}"
                 )
 
@@ -185,15 +168,23 @@ class AnnotatedHit(GenomeFeature):
             locus_tag = qualifiers.get('locus_tag', [None])[0]
             sequence = qualifiers.get('translation', [None])[0]
 
+            # 1. Fallback for missing Protein ID
+            if protein_accession in [None, 'None', ''] and locus_tag not in [None, 'None', '']:
+                protein_accession = locus_tag
+
+            # 2. Fallback for missing Translation (PLSDB Fix)
+            if not sequence:
+                try:
+                    sequence = str(best_feature.extract(record.seq).translate(to_stop=True))
+                except Exception:
+                    pass
+
             self.protein_accession = protein_accession if protein_accession is not None else "None"
             self.locus_tag = locus_tag if locus_tag is not None else "None"
             self.aa_sequence = sequence if sequence is not None else "None"
 
             self.five_end = min(self.coding_start, self.coding_end)
             self.three_end = max(self.coding_start, self.coding_end)
-
-        if not self.feature_found:
-            print("Error: No feature found for\n " + str(self) + '\nCoverage value:' + str(max_coverage_val))
         
     def fetch_feature1(self, record, margin_limit=20, max_attempts=5, mult_factor=3):
         '''

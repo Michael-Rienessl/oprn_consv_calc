@@ -29,11 +29,12 @@
     "feature_limit": 1,
     "intergenic_limit": 150,
     "use_ref_limit": true,
-    "ref_limit_margin": 0.5
+    "ref_limit_margin": 0.5,
+    "allow_permutations": true
   }],
   "thread_limit": 4,
   "species_percent_id_limit": 0.45,
-  "output_dir": "output/test_edge_case_2/",
+  "output_dir": "output/test_edge_case/",
   "cache_dir": "cache_test_edge_case/",
   
   "reference": {
@@ -47,6 +48,11 @@
         "NP_958095.1",
         "NP_958096.1",
         "NP_958094.1"
+    ],
+    "names": [
+      "GenA",
+      "GenB",
+      "GenC"
     ]
   },
   "color_code": [{

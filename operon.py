@@ -4,6 +4,7 @@
 '''
 
 from features import AnnotatedHit, GenomeFeature
+import itertools
 
 class Operon:
 
@@ -17,63 +18,70 @@ class Operon:
         self.local_sim = 0.0
         self.local_aai = 0.0
 
-    def calculate_local_stats(self, reference_pairs):
+    def calculate_local_stats(self, reference_sequence, allow_permutations=False):
         '''
-        Calculates local structural similarity (SIM)
-        and average amino acid identity (AAI) just for this fragment.
+        Calculates local structural similarity (SIM) and AAI.
+        Includes Discovery Mode to find the best possible permutation fit.
         '''
-
-        #1 Calculate local AAI (average of all AnnotedHits in this operon)
         hits = [f for f in self.features if isinstance(f, AnnotatedHit)]
+
+        # 1. Calculate local AAI
         if hits:
             self.local_aai = sum(float(h.percent_identity) for h in hits) / len(hits)
         else:
             self.local_aai = 0.0
 
-        #2 Calculate local SIM
-        # Check how many reference pairs exist in dies specific fragment
-        if not reference_pairs:
+        if not reference_sequence:
             self.local_sim = 0.0
+            self.genetic_order = ""
             return
         
-        found_pairs_count = 0
+        # Generate the biologically correct sequence
+        query_sequence = [h.query_accession for h in hits]
+        
+        # IMPORTANT FOR CSV: Store the normalized Genetic Order here!
+        # Since we corrected the strand above, this is always the true transcriptional direction.
+        self.genetic_order = "-".join(query_sequence)
 
-        # Extract all pairs of query accessions that are directly adjacent in this operon
-        # (Intergenic features are ignored because they do not break the chain)
-        query_sequence = [f.query_accession for f in self.features if isinstance(f, AnnotatedHit)]
+        # Helper function for strict calculation of a specific sequence
+        def calc_strict_local_sim(ref_seq):
+            ref_pairs_temp = [(ref_seq[i], ref_seq[i+1]) for i in range(len(ref_seq)-1)]
+            local_pairs_temp = [(query_sequence[i], query_sequence[i+1]) for i in range(len(query_sequence)-1)]
+            found = sum(1 for rp in ref_pairs_temp if rp in local_pairs_temp)
+            return found / len(ref_pairs_temp) if ref_pairs_temp else 0.0
 
-        local_pairs = []
-        for i in range(len(query_sequence) - 1):
-            local_pairs.append((query_sequence[i], query_sequence[i+1]))
-            # Also count reverse pairs (since orientation in the genome can vary)
-            local_pairs.append((query_sequence[i+1], query_sequence[i]))
+        # 2. Standard SIM (Strict Reference Order)
+        self.local_sim = calc_strict_local_sim(reference_sequence)
 
-        for ref_p in reference_pairs:
-            if ref_p in local_pairs:
-                found_pairs_count += 1
+        # 3. Discovery Mode (Iterative test of all permutations)
+        self.best_perm_local_sim = self.local_sim
+        self.best_perm_order = "-".join(reference_sequence)
 
-        # Local SIM = Found pairs in this fragment / Total reference pairs
-        self.local_sim = found_pairs_count / len(reference_pairs)
+        if allow_permutations:
+            import itertools
+            # Test all full permutations (e.g., ABC, ACB, BAC...)
+            for perm in itertools.permutations(reference_sequence):
+                p_sim = calc_strict_local_sim(perm)
+                # If we find a permutation that fits the fragment better, we overwrite it
+                if p_sim > self.best_perm_local_sim:
+                    self.best_perm_local_sim = p_sim
+                    self.best_perm_order = "-".join(perm)
     
     def add_feature(self, feature):
         '''
-        Appends feature to the list of features associated with this operon and sorts it from 5' to 3'
-
-        Parameters
-        ----------
-        feature: GenomeFeature object
-            Feature to be added
-        
-        Returns
-        -------
-        None
+        Appends feature to the list of features associated with this operon.
+        Normalizes the list immediately: 
+          - Plus strand (+): sorted ascending (left to right)
+          - Minus strand (-): sorted descending (right to left, true biological direction)
         '''
-        #Checking if the feature is present in the features associated with the genome for this operon.
         if feature in self.genome_features:
             self.features.append(feature)
-            self.features = sorted(self.features, key=lambda feature: feature.five_end)
-        #else:
-         #   raise Exception("The feature you are trying to add is not in the genome assigned for this operon.")
+            
+            if self.strand == '+':
+                self.features = sorted(self.features, key=lambda f: f.five_end)
+            else:
+                # On the minus strand, transcription goes from high to low coordinates
+                self.features = sorted(self.features, key=lambda f: f.five_end, reverse=True)
     
     
     
