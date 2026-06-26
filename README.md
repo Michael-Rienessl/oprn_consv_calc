@@ -193,7 +193,7 @@ This creates an `itol_out/taxonomic/` directory containing:
 
 If you use this pipeline in your research, please cite:
 
-> Kitts, G., ... & Erill, I. (2023). *The evolutionary dynamics of the LexA regulon in the Vibrionales.* Frontiers in Microbiology, 14, 1175143.  
-> [https://doi.org/10.3389/fmicb.2023.1175143](https://doi.org/10.3389/fmicb.2023.1175143)
+> Kitts, G., Rogers, A., Teschler, J. K., Park, J. H., Trebino, M. A., Chaudry, I., Erill, I., & Yildiz, F. H. (2023). *The Rvv two-component regulatory system regulates biofilm formation and colonization in Vibrio cholerae*. PLOS Pathogens, 19(5), e1011415.  
+> [https://doi.org/10.1371/journal.ppat.1011415](https://doi.org/10.1371/journal.ppat.1011415)
 
 Please also cite any external databases and tools used in your analysis, including NCBI BLAST, NCBI Entrez, and iTOL.
