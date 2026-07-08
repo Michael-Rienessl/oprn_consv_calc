@@ -365,33 +365,280 @@ class GenomeFragment:
         
         return gf
 
+    def _merge_query_intervals(self, intervals):
+        """
+        Merge query-coordinate intervals from multiple HSPs.
+
+        Intervals are inclusive and 1-based, e.g. query_start=5, query_end=50.
+        """
+        cleaned = []
+
+        for start, end in intervals:
+            if start is None or end is None:
+                continue
+
+            try:
+                s = int(start)
+                e = int(end)
+            except Exception:
+                continue
+
+            if s > e:
+                s, e = e, s
+
+            cleaned.append((s, e))
+
+        if not cleaned:
+            return []
+
+        cleaned = sorted(cleaned, key=lambda x: (x[0], x[1]))
+
+        merged = [cleaned[0]]
+
+        for s, e in cleaned[1:]:
+            last_s, last_e = merged[-1]
+
+            if s <= last_e + 1:
+                merged[-1] = (last_s, max(last_e, e))
+            else:
+                merged.append((s, e))
+
+        return merged
+
+
+    def _intervals_total_length(self, intervals):
+        """
+        Inclusive interval length sum.
+        """
+        total = 0
+
+        for s, e in intervals:
+            total += int(e) - int(s) + 1
+
+        return total
+
+
+    def consolidate_hsps_by_feature(self, min_query_coverage=None):
+        """
+        Combine multiple HSPs that map to the same CDS feature and apply
+        the query coverage cutoff after HSP consolidation.
+
+        Grouping key:
+            query_accession + nucleotide accession + mapped CDS identity/coordinates + strand
+
+        This changes the coverage logic from:
+            individual HSP coverage >= coverage_min
+
+        to:
+            merged query coverage of all HSPs mapping to the same CDS feature >= coverage_min
+        """
+
+        if not self.hits:
+            return
+
+        mapped_hits = []
+        unmapped_hits = []
+
+        for hit in self.hits:
+            if getattr(hit, "feature_found", False):
+                mapped_hits.append(hit)
+            else:
+                unmapped_hits.append(hit)
+
+        if unmapped_hits:
+            logging.debug(
+                f"[COMBINED_HSP_COVERAGE] {self.genome_accession}: "
+                f"removing {len(unmapped_hits)} unmapped HSP(s) before coverage consolidation."
+            )
+
+        if not mapped_hits:
+            logging.warning(
+                f"[COMBINED_HSP_COVERAGE] {self.genome_accession}: "
+                "no mapped HSPs remain after feature mapping."
+            )
+            self.hits = []
+            return
+
+        grouped = {}
+
+        for hit in mapped_hits:
+            key = (
+                getattr(hit, "query_accession", None),
+                getattr(hit, "genome_accession", None),
+                getattr(hit, "protein_accession", None),
+                getattr(hit, "locus_tag", None),
+                getattr(hit, "coding_start", None),
+                getattr(hit, "coding_end", None),
+                getattr(hit, "strand", None),
+            )
+
+            grouped.setdefault(key, []).append(hit)
+
+        consolidated_hits = []
+
+        for key, hits in grouped.items():
+
+            # Determine query length.
+            query_lengths = [
+                getattr(h, "query_length", None)
+                for h in hits
+                if getattr(h, "query_length", None) not in [None, 0, "0", ""]
+            ]
+
+            if query_lengths:
+                try:
+                    query_length = int(query_lengths[0])
+                except Exception:
+                    query_length = None
+            else:
+                query_length = None
+
+            intervals = [
+                (
+                    getattr(h, "query_start", None),
+                    getattr(h, "query_end", None),
+                )
+                for h in hits
+            ]
+
+            merged_intervals = self._merge_query_intervals(intervals)
+            covered_aa = self._intervals_total_length(merged_intervals)
+
+            if query_length and query_length > 0:
+                combined_cov = covered_aa / query_length
+            else:
+                # Fallback only for older AnnotatedHit objects without query coordinates.
+                hsp_covs = [
+                    getattr(h, "hsp_coverage", None)
+                    for h in hits
+                    if getattr(h, "hsp_coverage", None) is not None
+                ]
+
+                combined_cov = max(hsp_covs) if hsp_covs else None
+
+            # Select representative HSP:
+            # best e-value, then highest bitscore, then highest individual HSP coverage.
+            def _rank_hit(h):
+                evalue = getattr(h, "evalue", None)
+                bitscore = getattr(h, "bitscore", None)
+                hsp_cov = getattr(h, "hsp_coverage", None)
+
+                try:
+                    evalue_rank = float(evalue)
+                except Exception:
+                    evalue_rank = float("inf")
+
+                try:
+                    bitscore_rank = -float(bitscore)
+                except Exception:
+                    bitscore_rank = float("inf")
+
+                try:
+                    cov_rank = -float(hsp_cov)
+                except Exception:
+                    cov_rank = float("inf")
+
+                return (evalue_rank, bitscore_rank, cov_rank)
+
+            representative = sorted(hits, key=_rank_hit)[0]
+
+            representative.combined_hsp_count = len(hits)
+            representative.combined_query_coverage = combined_cov
+            representative.combined_query_covered_aa = covered_aa
+            representative.combined_query_intervals = ";".join(
+                f"{s}-{e}" for s, e in merged_intervals
+            )
+
+            if min_query_coverage is not None:
+                try:
+                    min_cov = float(min_query_coverage)
+                except Exception:
+                    min_cov = None
+            else:
+                min_cov = None
+
+            if min_cov is not None:
+                if combined_cov is None or combined_cov < min_cov:
+                    logging.debug(
+                        f"[COMBINED_HSP_COVERAGE] rejected "
+                        f"fragment={self.genome_accession} "
+                        f"query={getattr(representative, 'query_accession', None)} "
+                        f"feature={getattr(representative, 'protein_accession', None)} "
+                        f"locus={getattr(representative, 'locus_tag', None)} "
+                        f"combined_coverage={combined_cov} "
+                        f"required={min_cov} "
+                        f"hsp_count={len(hits)} "
+                        f"intervals={representative.combined_query_intervals}"
+                    )
+                    continue
+
+            logging.debug(
+                f"[COMBINED_HSP_COVERAGE] accepted "
+                f"fragment={self.genome_accession} "
+                f"query={getattr(representative, 'query_accession', None)} "
+                f"feature={getattr(representative, 'protein_accession', None)} "
+                f"locus={getattr(representative, 'locus_tag', None)} "
+                f"combined_coverage={combined_cov} "
+                f"hsp_count={len(hits)} "
+                f"intervals={representative.combined_query_intervals}"
+            )
+
+            consolidated_hits.append(representative)
+
+        self.hits = consolidated_hits
+
+        logging.info(
+            f"[COMBINED_HSP_COVERAGE] {self.genome_accession}: "
+            f"mapped_HSPs={len(mapped_hits)}, "
+            f"feature_groups={len(grouped)}, "
+            f"accepted_features={len(self.hits)}, "
+            f"coverage_min={min_query_coverage}"
+        )
 
     def purge_hits(self):
-        '''
-        Removes any duplicates from the list of hits.
+        """
+        Removes duplicate mapped hits after feature-level HSP consolidation.
 
-        Parameters
-        ----------
-        None
+        Duplicates are defined by:
+            query_accession + protein_accession + locus_tag + coordinates + strand
 
-        Returns
-        -------
-        None
-        '''
-        
-        #Remove any duplicate features so that no more than
-        logging.info(f"Purging hits... Pre-purge count: {len(self.hits)}")  
+        This prevents different query genes from being collapsed only because
+        they map to the same nucleotide record or because protein_accession is missing.
+        """
 
-        seen_accessions = set()
+        logging.info(f"Purging hits... Pre-purge count: {len(self.hits)}")
+
+        seen = set()
         purged_hits = []
+
         for hit in self.hits:
-            if hit.protein_accession not in seen_accessions:
+
+            if not getattr(hit, "feature_found", False):
+                logging.debug(
+                    f"UNMAPPED HIT REMOVED: "
+                    f"{getattr(hit, 'query_accession', None)} on {getattr(hit, 'genome_accession', None)}"
+                )
+                continue
+
+            key = (
+                getattr(hit, "query_accession", None),
+                getattr(hit, "protein_accession", None),
+                getattr(hit, "locus_tag", None),
+                getattr(hit, "five_end", None),
+                getattr(hit, "three_end", None),
+                getattr(hit, "strand", None),
+            )
+
+            if key not in seen:
                 purged_hits.append(hit)
-                seen_accessions.add(hit.protein_accession)
+                seen.add(key)
             else:
-                logging.debug(f"DUPLICATE REMOVED: {hit.protein_accession} on {hit.genome_accession} (Locus Tag: {hit.locus_tag})")
-        
+                logging.debug(
+                    f"DUPLICATE REMOVED: {key} on {getattr(hit, 'genome_accession', None)}"
+                )
+
         self.hits = purged_hits
+
         logging.info(f"Purging hits... Post-purge count: {len(self.hits)}")
             
         

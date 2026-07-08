@@ -80,13 +80,44 @@ class AnnotatedHit(GenomeFeature):
     about the alignment start/stop positions and the query accesion. 
     
     '''
-    def __init__(self,query_accession, hit_accession, genome_fragment_name, align_start, align_end, strand, alignment_seq, percent_identity, req_limit, sleep_time):
+    def __init__(
+        self,
+        query_accession,
+        hit_accession,
+        genome_fragment_name,
+        align_start,
+        align_end,
+        strand,
+        alignment_seq,
+        percent_identity,
+        req_limit,
+        sleep_time,
+        query_start=None,
+        query_end=None,
+        query_length=None,
+        hsp_coverage=None,
+        evalue=None,
+        bitscore=None):
+
         self.query_accession = query_accession
         self.align_start = align_start
         self.align_end = align_end
         self.feature_found = False
         self.percent_identity = percent_identity
         self.alignment_seq = alignment_seq
+
+        self.query_start = query_start
+        self.query_end = query_end
+        self.query_length = query_length
+        self.hsp_coverage = hsp_coverage
+        self.evalue = evalue
+        self.bitscore = bitscore
+
+        # Filled later after HSP consolidation.
+        self.combined_hsp_count = 1
+        self.combined_query_coverage = hsp_coverage
+        self.combined_query_covered_aa = None
+        self.combined_query_intervals = None
         
         if strand > 0:
             self.strand = '+'
@@ -157,6 +188,8 @@ class AnnotatedHit(GenomeFeature):
                     f"BLAST: {align_five_end}-{align_three_end} | GenBank: {feat_start}-{feat_end} | "
                     f"Calculated Coverage: {feat_coverage:.4f}"
                 )
+
+        self.feature_mapping_coverage = max_coverage_val
 
         if best_feature is not None and max_coverage_val > coverage_cutoff:
             self.feature_found = True

@@ -137,11 +137,8 @@ def _is_informative_blast_identifier(value):
     """
     Return True if a BLAST identifier is useful as a biological/accession ID.
 
-    Important:
-    - Reject BLAST-internal ordinal IDs such as BL_ORD_ID.
-    - Reject database-wrapper tokens such as gnl/ref/gb/lcl when they occur alone.
-    - Reject pure numeric ordinal IDs.
-    - Do NOT remove user/database prefixes such as RefSeq_, PLSDB_, or NZ_.
+    Rejects BLAST/NCBI wrapper tokens such as gi, ref, gb, gnl, lcl,
+    and BLAST-internal ordinal IDs such as BL_ORD_ID.
     """
     if value is None:
         return False
@@ -166,6 +163,9 @@ def _is_informative_blast_identifier(value):
         "dbj",
         "pir",
         "sp",
+        "gi",       # IMPORTANT FIX for remote BLAST
+        "bbs",
+        "gnl",
     }
 
     if s in bad_values:
@@ -177,81 +177,149 @@ def _is_informative_blast_identifier(value):
     if s.startswith("gnl|BL_ORD_ID"):
         return False
 
-    # BLAST ordinal identifiers are often pure integers after splitting
-    # gnl|BL_ORD_ID|123. These are not biological accessions.
     if s.isdigit():
         return False
 
     return True
 
 
+def _looks_like_nuccore_accession(value):
+    """
+    Recognize common nucleotide accession patterns.
+    Examples:
+      NC_016583.1
+      NZ_CP035950.1
+      CP035950.1
+      JABCDX010000001.1
+      RefSeq_NZ_CP035950.1
+    """
+    if value is None:
+        return False
+
+    s = str(value).strip()
+
+    if not _is_informative_blast_identifier(s):
+        return False
+
+    # Remove project-specific prefix but keep normal accession body.
+    if s.startswith("RefSeq_"):
+        s2 = s[len("RefSeq_"):]
+    else:
+        s2 = s
+
+    patterns = [
+        r"^(NC|NZ|NT|NW|NG|NM|XM|XR|CP|CM|AP|AE|AC|AL|AM|BX|CU|FM|FO|HE|HG|HF|LN|LT|LR|LS|OU|OV|OX|OZ)_[A-Z0-9]+(\.\d+)?$",
+        r"^[A-Z]{1,4}\d{5,9}(\.\d+)?$",
+        r"^[A-Z]{4,6}\d{8,12}(\.\d+)?$",
+    ]
+
+    return any(re.match(p, s2) for p in patterns)
+
+
+def _extract_accession_from_text(text):
+    """
+    Search hit_id or hit_def text for a nucleotide accession.
+    """
+    if not text:
+        return None
+
+    text = str(text)
+
+    # Prefer explicit RefSeq_/NZ_/NC_/CP-like tokens.
+    candidates = re.findall(
+        r"(?:RefSeq_)?(?:NC|NZ|NT|NW|NG|CP|CM|AP|AE|AC|AL|AM|BX|CU|FM|FO|HE|HG|HF|LN|LT|LR|LS|OU|OV|OX|OZ)_[A-Z0-9]+(?:\.\d+)?",
+        text,
+    )
+
+    # Also allow CP035950.1-like accessions without underscore.
+    candidates.extend(
+        re.findall(
+            r"\b[A-Z]{1,4}\d{5,9}(?:\.\d+)?\b",
+            text,
+        )
+    )
+
+    # WGS/contig-like accessions.
+    candidates.extend(
+        re.findall(
+            r"\b[A-Z]{4,6}\d{8,12}(?:\.\d+)?\b",
+            text,
+        )
+    )
+
+    for c in candidates:
+        if _looks_like_nuccore_accession(c):
+            return c
+
+    return None
+
+
 def extract_blast_hit_accession(alignment):
     """
-    Extract the nucleotide accession / FASTA record ID from a BLAST alignment
-    object without database-specific rewriting.
+    Extract a usable nucleotide accession from a BLAST alignment.
 
-    This function is robust to local BLAST databases built without
-    makeblastdb -parse_seqids. In that case BLAST XML often reports:
-
-        hit_id  = gnl|BL_ORD_ID|123
-        hit_def = RefSeq_NZ_CP....1 ...
-
-    The biological record ID is then the first token of hit_def, not "gnl",
-    "BL_ORD_ID", or "123".
-
-    This function does NOT strip RefSeq_, PLSDB_, NZ_, or version suffixes.
+    Handles:
+      - remote NCBI BLAST IDs, e.g. gi|...|ref|NZ_CP....1|
+      - local BLAST IDs, e.g. gnl|BL_ORD_ID|123 with original ID in hit_def
+      - simple FASTA IDs
     """
 
     hit_id = str(getattr(alignment, "hit_id", "")).strip()
     accession = str(getattr(alignment, "accession", "")).strip()
     hit_def = str(getattr(alignment, "hit_def", "")).strip()
 
-    # 1. Local BLAST without -parse_seqids:
-    #    gnl|BL_ORD_ID|123 is an internal ordinal ID.
-    #    The original FASTA header is in hit_def.
-    if (
-        hit_id.startswith("gnl|BL_ORD_ID")
-        or hit_id.startswith("BL_ORD_ID")
-        or accession.startswith("BL_ORD_ID")
-    ):
-        if hit_def:
-            first_token = hit_def.split()[0].strip()
-            if _is_informative_blast_identifier(first_token):
-                return first_token
+    # ------------------------------------------------------------
+    # 1. Search accession-like strings in hit_id first.
+    # ------------------------------------------------------------
+    acc = _extract_accession_from_text(hit_id)
 
-    # 2. NCBI/BLAST pipe-style IDs, e.g. ref|NC_000000.1| or gb|CP000000.1|
-    #    Try the biologically meaningful accession-like fields, but skip wrapper
-    #    tokens such as ref, gb, gnl, and BL_ORD_ID.
+    if acc:
+        return acc
+
+    # ------------------------------------------------------------
+    # 2. Search accession-like strings in hit_def.
+    # ------------------------------------------------------------
+    acc = _extract_accession_from_text(hit_def)
+
+    if acc:
+        return acc
+
+    # ------------------------------------------------------------
+    # 3. Pipe-style fallback.
+    #    Important: skip gi/ref/gb/gnl/lcl wrappers.
+    # ------------------------------------------------------------
     if "|" in hit_id:
         parts = [str(x).strip() for x in hit_id.split("|") if str(x).strip()]
 
-        # Prefer the second field for standard NCBI IDs:
-        # ref|NC_000000.1| -> NC_000000.1
-        if len(parts) >= 2 and _is_informative_blast_identifier(parts[1]):
-            return parts[1]
+        for candidate in parts:
+            if _looks_like_nuccore_accession(candidate):
+                return candidate
 
-        # Otherwise scan all parts for the first informative identifier.
         for candidate in parts:
             if _is_informative_blast_identifier(candidate):
                 return candidate
 
-    # 3. Simple local FASTA IDs may appear directly as hit_id.
-    if _is_informative_blast_identifier(hit_id):
-        return hit_id
+    # ------------------------------------------------------------
+    # 4. Biopython accession fallback.
+    # ------------------------------------------------------------
+    if _looks_like_nuccore_accession(accession):
+        return accession
 
-    # 4. Biopython's accession field is useful for remote BLAST, but in local
-    #    BLAST it can be BL_ORD_ID. Use it only if informative.
     if _is_informative_blast_identifier(accession):
         return accession
 
-    # 5. Last local fallback: first hit_def token is usually the original FASTA ID.
+    # ------------------------------------------------------------
+    # 5. Local BLAST without parse_seqids fallback:
+    #    first token of hit_def may be original FASTA ID.
+    # ------------------------------------------------------------
     if hit_def:
         first_token = hit_def.split()[0].strip()
+
         if _is_informative_blast_identifier(first_token):
             return first_token
 
     raise ValueError(
-        f"Could not extract a usable BLAST hit accession. "
+        f"Could not extract usable BLAST hit accession. "
         f"hit_id={hit_id!r}, accession={accession!r}, hit_def={hit_def!r}"
     )
 
@@ -606,7 +674,22 @@ def search_blast(
                 if len(query_id_for_hit) > 20:
                     query_id_for_hit = "SEQ_" + query_id_for_hit[:10]
 
-                # Initiate AnnotatedHit if requested
+                query_length = len(input_seq.seq)
+
+                hsp_query_start = getattr(hit, "query_start", None)
+                hsp_query_end = getattr(hit, "query_end", None)
+
+                if hsp_query_start is not None and hsp_query_end is not None and query_length > 0:
+                    hsp_cov = (abs(int(hsp_query_end) - int(hsp_query_start)) + 1) / query_length
+                else:
+                    hsp_cov = None
+
+                hsp_evalue = getattr(hit, "expect", None)
+                hsp_bitscore = getattr(hit, "bits", None)
+
+                if hsp_bitscore is None:
+                    hsp_bitscore = getattr(hit, "score", None)
+
                 if annotate:
                     a_hit = AnnotatedHit(
                         query_accession=query_id_for_hit,
@@ -618,39 +701,35 @@ def search_blast(
                         strand=hit.frame[1],
                         percent_identity=(hit.identities / hit.align_length),
                         req_limit=REQUEST_LIMIT,
-                        sleep_time=SLEEP_TIME
+                        sleep_time=SLEEP_TIME,
+                        query_start=hsp_query_start,
+                        query_end=hsp_query_end,
+                        query_length=query_length,
+                        hsp_coverage=hsp_cov,
+                        evalue=hsp_evalue,
+                        bitscore=hsp_bitscore,
                     )
 
-                # Coverage filter
-                if min_cover:
-                    cov = (hit.query_end - hit.query_start + 1) / (len(input_seq.seq))
-                    print('\t\t\tCoverage value: ' + str(cov))
+                    # IMPORTANT:
+                    # Do NOT apply coverage_min here anymore.
+                    # Each individual HSP is retained. HSPs are later mapped to CDS features
+                    # and combined per query + feature before coverage_min is applied.
+                    if hsp_cov is not None:
+                        print("\t\t\tHSP coverage value: " + str(hsp_cov))
 
-                    if cov >= min_cover:
-                        if annotate:
-                            return_hits.append(a_hit)
-                        else:
-                            return_hits.append((query_id_for_hit, curr_hit_rec, record))
-                    else:
-                        print("\t\t|~> Hit did not meet coverage requirement: " + str(curr_hit_rec))
-                        print('\t\t\tCoverage value: ' + str(cov))
+                    return_hits.append(a_hit)
 
                 else:
-                    # Append unique hits
-                    if annotate:
-                        if len(return_hits) == 0:
-                            print("\t\t|~> Adding first hit: " + str(curr_hit_rec))
-                            return_hits.append(a_hit)
-                        elif not (a_hit in return_hits):
-                            print("\t\t|~> Adding hit: " + str(curr_hit_rec))
-                            return_hits.append(a_hit)
+                    # Non-annotated mode cannot perform feature-level HSP consolidation.
+                    # Keep the old per-HSP behavior here for backwards compatibility.
+                    if min_cover:
+                        if hsp_cov is not None and hsp_cov >= min_cover:
+                            return_hits.append((query_id_for_hit, curr_hit_rec, record))
+                        else:
+                            print("\t\t|~> Hit did not meet per-HSP coverage requirement: " + str(curr_hit_rec))
+                            print("\t\t\tHSP coverage value: " + str(hsp_cov))
                     else:
-                        if len(return_hits) == 0:
-                            print("\t\t|~> Adding first hit: " + str(curr_hit_rec))
-                            return_hits.append((query_id_for_hit, curr_hit_rec, record))
-                        elif not (curr_hit_rec in list(zip(*return_hits))[1]):
-                            print("\t\t|~> Adding hit: " + str(curr_hit_rec))
-                            return_hits.append((query_id_for_hit, curr_hit_rec, record))
+                        return_hits.append((query_id_for_hit, curr_hit_rec, record))
 
     print("\t|~> Returning " + str(len(return_hits)) + " unique hits")
     return return_hits
@@ -789,38 +868,59 @@ def local_blast_search(input_record, db_path, e_cutoff=10-10, min_cover=None):
         # Iterate through the hits
         for hit in record.hsps:
 
-            # Initiates a AnnotatedHit object if set by the parameters.
+            hsp_query_start = getattr(hit, "query_start", None)
+            hsp_query_end = getattr(hit, "query_end", None)
+
+            if hsp_query_start is not None and hsp_query_end is not None and query_length > 0:
+                hsp_cov = (abs(int(hsp_query_end) - int(hsp_query_start)) + 1) / query_length
+            else:
+                hsp_cov = None
+
+            hsp_evalue = getattr(hit, "expect", None)
+            hsp_bitscore = getattr(hit, "bits", None)
+
+            if hsp_bitscore is None:
+                hsp_bitscore = getattr(hit, "score", None)
+
             a_hit = AnnotatedHit(
-                query_accession=input_record, 
-                hit_accession=curr_hit_rec, 
-                genome_fragment_name=current_hit_def, 
-                align_start=hit.sbjct_start, 
-                alignment_seq=hit.sbjct, 
-                align_end=hit.sbjct_end, 
-                strand=hit.frame[1], 
-                percent_identity=(hit.identities/hit.align_length), 
-                req_limit=REQUEST_LIMIT, 
-                sleep_time=SLEEP_TIME
+                query_accession=input_record,
+                hit_accession=curr_hit_rec,
+                genome_fragment_name=current_hit_def,
+                align_start=hit.sbjct_start,
+                alignment_seq=hit.sbjct,
+                align_end=hit.sbjct_end,
+                strand=hit.frame[1],
+                percent_identity=(hit.identities / hit.align_length),
+                req_limit=REQUEST_LIMIT,
+                sleep_time=SLEEP_TIME,
+                query_start=hsp_query_start,
+                query_end=hsp_query_end,
+                query_length=query_length,
+                hsp_coverage=hsp_cov,
+                evalue=hsp_evalue,
+                bitscore=hsp_bitscore,
             )
 
-            if min_cover == None:
-                if annotate:
-                    return_hits.append(a_hit)
-                else:
-                    return_hits.append((input_record, curr_hit_rec, record))
-                continue
+            if annotate:
+                # IMPORTANT:
+                # Do NOT apply coverage_min here anymore.
+                # Coverage is evaluated later after multiple HSPs have been mapped
+                # to the same CDS feature and combined.
+                if hsp_cov is not None:
+                    print("\t\t\tHSP coverage value: " + str(hsp_cov))
 
-            # Calculate the coverage for the current hit                  
-            cov = (hit.query_end - hit.query_start + 1) / (query_length)
-            print('\t\t\tCoverage value: ' + str(cov))
-            
-            if cov >= min_cover:
-                if annotate:
-                    return_hits.append(a_hit)
-                else:
-                    return_hits.append((input_record, curr_hit_rec ,record))
+                return_hits.append(a_hit)
+
             else:
-                print("\t\t|~> Hit did not meet coverage requirement: " + str(curr_hit_rec))
+                # Non-annotated mode cannot perform feature-level HSP consolidation.
+                # Keep the old per-HSP behavior here for backwards compatibility.
+                if min_cover is None:
+                    return_hits.append((input_record, curr_hit_rec, record))
+                elif hsp_cov is not None and hsp_cov >= min_cover:
+                    return_hits.append((input_record, curr_hit_rec, record))
+                else:
+                    print("\t\t|~> Hit did not meet per-HSP coverage requirement: " + str(curr_hit_rec))
+                    print("\t\t\tHSP coverage value: " + str(hsp_cov))
                 
     print("\t|~> Returning " + str(len(return_hits)) + " unique hits")
     return return_hits
@@ -1689,16 +1789,11 @@ def process_frag(fragment, lock):
     Will complete the GenomeFragment object that is passed in by:
         1. Fetching all the features for the fragment
         2. Assign the features for the hit
-        3. Assemble the operon
+        3. Combine multiple HSPs mapping to the same feature
+        4. Apply combined query coverage filtering
+        5. Assemble the operon
     
-    Note: This function was implemented so that the fragments could be processed on multiple threads. 
-    
-    Parameters
-    ----------
-    fragment: GenomeFragment object
-        The fragment to be processed.
-    lock: ThreadLock
-        Needed to print out to screen in sync
+    Note: This function was implemented so that the fragments can be processed on multiple threads.
     '''
 
     try:
@@ -1723,14 +1818,56 @@ def process_frag(fragment, lock):
         )
         return
 
-    fragment.fetch_hit_features(margin_limit=margin_limit, max_attempts=max_feature_detect_attempts, mult_factor=feature_search_mult_factor)
+    fragment.fetch_hit_features(
+        margin_limit=margin_limit,
+        max_attempts=max_feature_detect_attempts,
+        mult_factor=feature_search_mult_factor
+    )
+
+    # New coverage logic:
+    # HSPs are first mapped to CDS features.
+    # Then all HSPs mapping to the same query + CDS feature are merged.
+    # coverage_min is applied to the combined query coverage.
+    fragment.consolidate_hsps_by_feature(
+        min_query_coverage=coverage_min
+    )
+
+    if not fragment.hits:
+        logging.warning(
+            f"[SKIP] {fragment.genome_accession}: "
+            "no mapped CDS hits remain after combined HSP coverage filtering."
+        )
+        fragment.operons = []
+
+        del fragment.full_record
+        fragment.full_record = None
+
+        return
+
     fragment.purge_hits()
-    fragment.assemble_operons(feature_limit=feature_limit, intergenic_limit=intergenic_limit)
+
+    if not fragment.hits:
+        logging.warning(
+            f"[SKIP] {fragment.genome_accession}: "
+            "no hits remain after duplicate purging."
+        )
+        fragment.operons = []
+
+        del fragment.full_record
+        fragment.full_record = None
+
+        return
+
+    fragment.assemble_operons(
+        feature_limit=feature_limit,
+        intergenic_limit=intergenic_limit
+    )
+
     lock.acquire()
-    tqdm.write("Completed:\n" + str(fragment) + "-"*50)
+    tqdm.write("Completed:\n" + str(fragment) + "-" * 50)
     lock.release()
 
-    #Clear up memory by deleting the full features list
+    # Clear up memory by deleting the full record
     del fragment.full_record
     fragment.full_record = None
 
